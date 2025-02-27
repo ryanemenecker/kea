@@ -1,0 +1,11 @@
+Future implementations
+short term...
+1. Add in weighting for codon pairs.
+2. add more organisms
+3. implement dnahive (see https://dnahive.fda.gov/dna.cgi?cmd=codon_usage&id=537&mode=cocoputs)
+4. Add in ability to avoid restriction sites
+5. Add in ability to avoid repetetive regions. 
+
+Long term...
+1. ML-based functionaltiy that is trained on CDS for many different organisms
+2. Fine tune the network form 1 on individual organisms.
