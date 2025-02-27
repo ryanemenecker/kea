@@ -9,8 +9,7 @@ import numpy as np
 from tqdm import tqdm
 from kea.data.aa_codon_conversions import aa_to_codons, codons_to_aa
 from kea.data.codon_tables import s288c_codon_usage
-from kea.backend.kea_utils import graph_codon_usage
-import matplotlib.pyplot as plt
+
 
 
 def _build_sequence(amino_acid_sequence, aa_weights):
@@ -376,10 +375,3 @@ def optimize_codon_usage_for_library(
     else:
         return optimized_sequences
 
-
-
-test=['MIPKGFTKLTEHFTKDKGTFITKGETIKNPAKKRKSSAKGGSGRTAGDAANETAQQASATAKAGARKQRASAEEKAA','MLPKGFTKITEHFTKDKGTFMTKGETIKSPVKKKKTSMKGGTGKTAGDAASETANQASANARAGAKRQRANAEDRAA','MVPKGFTKMTEHFTKDKGTFITKGESVKTPIRRKKTNARGGQGKSAGEAASETAQSASVNAKAGAKRNKASADERAA','MPKGFTKVTDHFTKEKGTFITKGETVKSPVKKKKTSARGGSGKTAGEAAQDTATQASANARAGAKKNRANAEEKAA','MLPKGFTKMTDHFTKDKGTFMTKGDTMKTPMKKKKSTLKGGTGKTMGDMITETINSAQANAKAGAKRQKAQADDKAA','MIPKGFTKVTEHFTKDKGTFLTKGDTMKTPMKKKKTSMKGGTGKTIGDAANDQANSASVNARAGARKQKANADERAA']
-optimized_sequences = optimize_codon_usage_for_library(
-    test,
-    s288c_codon_usage)
-print(optimized_sequences)

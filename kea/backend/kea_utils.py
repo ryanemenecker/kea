@@ -30,6 +30,25 @@ def dna_to_aa(dna_sequence):
         aa_sequence += aa
     return aa_sequence
 
+def find_first_orf(sequence):
+    '''
+    Find the first open reading frame (ORF) in a DNA sequence.
+    parameters
+    ----------
+    sequence (str): DNA sequence string
+
+    Returns
+    --------
+    int: Start index of the first ORF, or -1 if not found.
+    '''
+    start_codon = "ATG"
+    for i in range(0, len(sequence) - 2, 3):
+        codon = sequence[i:i+3]
+        if codon == start_codon:
+            return i
+    return -1
+
+
 
 def calc_gc_content(sequence):
     gc_count = sequence.count('G') + sequence.count('C')
@@ -144,117 +163,32 @@ def calculate_codon_usage_table(path_to_file, require_start_codon=True):
         print(f"Error calculating codon usage: {str(e)}")
         return None
 
-
-def graph_codon_usage(sequence, codon_table):
+def get_restriction_enzymes(path_to_file):
     '''
-    Creates a single plot that compares codon usage between a sequence (or list of 
-    sequences) and a reference codon table.
+    Get a list of restriction enzymes from a file.
     
-    Parameters
-    ----------
-    sequence : str or list
-        DNA sequence or list of DNA sequences to analyze.
-    codon_table : dict
-        Reference codon usage table {aa: {codon: frequency}}
-    
-    Returns
-    -------
-    matplotlib.figure.Figure
-        The generated figure object
+    Args:
+        path_to_file (str): Path to the file containing restriction enzyme information
+        
+    Returns:
+        list: List of restriction enzymes
     '''
-    # Convert single sequence to list for consistent handling
-    if isinstance(sequence, str):
-        sequences = [sequence]
-    else:
-        sequences = sequence
-    dna_sequences = [seq for seq in sequences if isinstance(seq, str)]
-
-    # Calculate codon usage for the provided sequences
-    sequence_codon_freqs = make_codon_table(dna_sequences)
-    
-    # Create a single plot with all codons
-    fig, ax = plt.subplots(figsize=(16, 8))
-    
-    # Prepare data for plotting
-    all_codons = []
-    ref_values = []
-    seq_values = []
-    aa_boundaries = [0]  # Track where each amino acid group ends
-    aa_centers = []      # Track center position for amino acid labels
-    
-    # Sort amino acids for consistent display
-    amino_acids = sorted(codon_table.keys())
-    
-    # Collect data for each amino acid
-    current_position = 0
-    for aa in amino_acids:
-        codons = sorted(codon_table[aa].keys())
-        start_pos = len(all_codons)
+    try:
+        restriction_enzyme_dict={}
+        with open(path_to_file, 'r') as f:
+            lines = f.read().split('\n')
         
-        for codon in codons:
-            all_codons.append(codon)
-            ref_values.append(codon_table[aa].get(codon, 0))
-            if aa in sequence_codon_freqs and codon in sequence_codon_freqs[aa]:
-                seq_values.append(sequence_codon_freqs[aa][codon])
-            else:
-                seq_values.append(0)
-        
-        # Calculate center position for this amino acid group
-        if codons:  # Only if there are codons for this amino acid
-            aa_centers.append((start_pos + len(all_codons) - 1) / 2)
-            # Update the boundaries after processing each amino acid
-            aa_boundaries.append(len(all_codons))
+        for line in lines:
+            site=line.split()[0]
+            enzymes=line.split()[1:]
+            for e in enzymes:
+                restriction_enzyme_dict[e]=site
+        return restriction_enzyme_dict
+    except FileNotFoundError:
+        print(f"Error: File not found: {path_to_file}")
+        return None
+    except Exception as e:
+        print(f"Error reading restriction enzymes: {str(e)}")
+        return None
     
-    # Plot bars
-    x = np.arange(len(all_codons))
-    width = 0.35
-    
-    ref_bars = ax.bar(x - width/2, ref_values, width, label='Reference', color='steelblue', alpha=0.8)
-    seq_bars = ax.bar(x + width/2, seq_values, width, label='Sequence', color='darkorange', alpha=0.8)
-    
-    # Add vertical lines to separate amino acid groups
-    for boundary in aa_boundaries[1:-1]:  # Skip first and last boundaries
-        ax.axvline(x=boundary - 0.5, color='gray', linestyle='--', alpha=0.3)
-    
-    # Add amino acid labels
-    for i, aa in enumerate(amino_acids):
-        if i < len(aa_centers):
-            ax.text(aa_centers[i], -0.05, aa, transform=ax.get_xaxis_transform(),
-                    ha='center', fontsize=12, fontweight='bold')
-    
-    # Customize plot
-    ax.set_xticks(x)
-    ax.set_xticklabels(all_codons, rotation=90, fontsize=8)  # Smaller font size for readability
-    
-    # Fix overlapping x-axis labels by limiting the number of visible ticks if too many
-    if len(all_codons) > 40:
-        # Show only a subset of ticks to avoid overcrowding
-        for i, label in enumerate(ax.get_xticklabels()):
-            if i % 2 != 0:  # Show every other label
-                label.set_visible(False)
-    
-    ax.set_xlabel('Codons', fontsize=12)
-    ax.set_ylabel('Frequency', fontsize=12)
-    ax.set_title('Codon Usage Comparison', fontsize=14, fontweight='bold')
-    ax.legend(loc='upper right')
-    
-    # Handle empty values gracefully
-    max_value = max(max(ref_values) if ref_values else 0, 
-                    max(seq_values) if seq_values else 0)
-    ax.set_ylim(0, max_value * 1.1 or 1.0)  # Fallback to 1.0 if all values are 0
-    
-    # Add value labels for bars with significant usage
-    def add_value_labels(bars):
-        threshold = 0.05  # Show more values by lowering threshold
-        for bar in bars:
-            height = bar.get_height()
-            if height >= threshold:
-                ax.text(bar.get_x() + bar.get_width()/2., height + 0.01,
-                        f'{height:.2f}', ha='center', va='bottom', fontsize=8)
-    
-    add_value_labels(ref_bars)
-    add_value_labels(seq_bars)
-    
-    plt.tight_layout()
-    
-    return fig
+print(get_restriction_enzymes('/Users/ryanemenecker/Desktop/lab_packages/kea/kea/data/restriction_enzymes.txt'))
