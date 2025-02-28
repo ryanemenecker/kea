@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 from collections import defaultdict
-
+import random
 
 def read_fasta(path_to_file):
     '''
@@ -144,3 +144,55 @@ def get_restriction_enzymes(path_to_file):
         print(f"Error reading restriction enzymes: {str(e)}")
         return None
     
+def generate_random_protein_ids(length_of_id, 
+                               number_of_ids,
+                               alphanumeric=True,
+                               cap_sensitive=False):
+    """
+    Generate random protein IDs.
+
+    Parameters
+    ----------
+    length_of_id (int): Length of each protein ID.
+    number_of_ids (int): Number of protein IDs to generate.
+    alphanumeric (bool): If True, include both letters and digits. 
+                         If False, include only numbers.
+    cap_sensitive (bool): If True, include both uppercase and lowercase letters.
+                          If False, include only uppercase letters.
+    Returns
+    -------
+    list: A list of unique random protein IDs.
+    
+    Raises
+    ------
+    ValueError: If the number of requested IDs exceeds the possible unique combinations.
+    """
+    # Define the character sets
+    digits = '0123456789'
+    uppercase = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    lowercase = 'abcdefghijklmnopqrstuvwxyz'
+    
+    # Select characters based on parameters
+    if alphanumeric:
+        if cap_sensitive:
+            # Include digits, uppercase, and lowercase
+            characters = digits + uppercase + lowercase
+        else:
+            # Include digits and uppercase only
+            characters = digits + uppercase
+    else:
+        # Only digits, regardless of cap_sensitive
+        characters = digits
+    
+    # Check if it's possible to generate the requested number of unique IDs
+    max_possible_ids = len(characters) ** length_of_id
+    if number_of_ids > max_possible_ids:
+        raise ValueError(f"Cannot generate {number_of_ids} unique IDs with length {length_of_id}. "
+                         f"Maximum possible is {max_possible_ids}.")
+    
+    unique_ids = set()
+    while len(unique_ids) < number_of_ids:
+        new_id = ''.join(random.choice(characters) for _ in range(length_of_id))
+        unique_ids.add(new_id)
+    
+    return list(unique_ids)

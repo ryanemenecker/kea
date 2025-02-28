@@ -55,7 +55,7 @@ def generate_barcode_sequences(num_barcodes, length,
     pass
 
 def create_padding_sequence(length,
-                            GC_content_target,
+                            GC_content_range, # changed from GC_content_target to GC_content_range
                             tolerance,
                             avoid_start_codon=True,
                             avoid_stop_codon=True,
@@ -70,8 +70,8 @@ def create_padding_sequence(length,
     ----------
     length : int
         Length of the padding sequence.
-    GC_content_target : float
-        Target GC content for the padding sequence.
+    GC_content_range : tuple of float
+        Target GC content range for the padding sequence.
     tolerance : float
         Tolerance for the GC content.
     avoid_start_codon : bool
@@ -96,6 +96,8 @@ def create_padding_sequence(length,
         avoid_adding = [avoid_adding]
 
     # Define nucleotide weights to achieve target GC content
+    # Use the midpoint of the GC content range for nucleotide weights
+    GC_content_target = (GC_content_range[0] + GC_content_range[1]) / 2
     gc_weight = GC_content_target / 2  # Split between G and C
     at_weight = (1 - GC_content_target) / 2  # Split between A and T
     nucleotide_weights = {'G': gc_weight, 'C': gc_weight, 
@@ -120,7 +122,7 @@ def create_padding_sequence(length,
         
         # Check GC content
         gc_content = calc_gc_content(padding)
-        if abs(gc_content - GC_content_target) > tolerance:
+        if not (GC_content_range[0] - tolerance <= gc_content <= GC_content_range[1] + tolerance):
             continue
         
         # Convert to list for easier modification
@@ -151,7 +153,7 @@ def create_padding_sequence(length,
         if modified:
             padding = ''.join(padding_list)
             gc_content = calc_gc_content(padding)
-            if abs(gc_content - GC_content_target) > tolerance:
+            if not (GC_content_range[0] - tolerance <= gc_content <= GC_content_range[1] + tolerance):
                 continue
         
         # Check for sequences to avoid - can't easily modify these in place
@@ -210,24 +212,23 @@ def add_padding(sequence, target_length, pad_location=3,
     # calculate possible target_GC content values
     # based on the length of the padding, the length
     # of the sequence, and the current GC content
-    possible_target_GC_content_values = []
-    for target_GC_content in [final_GC_content_range[0], final_GC_content_range[1]]:
-        # calculate the length of the padding
-        padding_length = target_length - len(sequence)
-        # calculate the GC content of the padding
-        padding_gc_content = (target_GC_content * target_length - current_gc_content * len(sequence)) / padding_length
-        # check if the padding GC content is valid
-        if 0 <= padding_gc_content <= 1:
-            possible_target_GC_content_values.append(padding_gc_content)
+    
+    padding_length = target_length - len(sequence)
+    
+    # Calculate the range of possible padding GC content values
+    padding_gc_content_range = (
+        (final_GC_content_range[0] * target_length - current_gc_content * len(sequence)) / padding_length,
+        (final_GC_content_range[1] * target_length - current_gc_content * len(sequence)) / padding_length
+    )
+    
     # check if any target GC content values are valid
-    if not possible_target_GC_content_values:
+    if not (0 <= padding_gc_content_range[0] <= 1 and 0 <= padding_gc_content_range[1] <= 1):
         raise ValueError("No valid target GC content values found.")
-    # choose a random target GC content value
-    target_gc_content = random.choice(possible_target_GC_content_values)
+    
     # create the padding sequence
     padding = create_padding_sequence(
         length=target_length - len(sequence),
-        GC_content_target=target_gc_content,
+        GC_content_range=padding_gc_content_range, # pass the range to create_padding_sequence
         tolerance=tolerance,
         avoid_start_codon=avoid_added_start_codons,
         avoid_stop_codon=avoid_added_stop_codons,

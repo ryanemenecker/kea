@@ -5,6 +5,7 @@ from DNA sequences
 from .backend.optimize_codon_usage import optimize_codon_usage_for_library
 from .backend.library_generation_utils import add_padding, add_3_prime_adapter, add_5_prime_adapter
 from .backend.translation_utils import translate_sequence
+from .backend.kea_utils import generate_random_protein_ids
 from .data.codon_tables import all_codon_tables
 
 def build_library(protein_sequences,
@@ -27,7 +28,9 @@ def build_library(protein_sequences,
                   gc_tolerance=0.025,
                   verify_unique_protein_sequences=True,
                   verify_start_stop_codons_in_adapters=False,
-                  show_optimization_progress=True):
+                  show_optimization_progress=True,
+                  add_protein_identifiers=False,
+                  protein_identifier_length=8):
     '''
     Function to build a library of nucleotide sequences from a list of protein sequences.
     The function will add adapters, padding, and optimize for GC content and codon usage.
@@ -35,7 +38,12 @@ def build_library(protein_sequences,
 
     Parameters
     ----------
-    protein_sequences (list): List of protein sequences.
+    protein_sequences (list or dict): List or dict of protein sequences.
+        if dict, expects {name: sequence}
+    codon_frequency_table (str or dict): Codon frequency table to use for optimization.
+        If str, must be one of ['yeast', 's288c', 's288c_unweighted']
+        If dict, must be a dictionary of codon frequencies.
+        Structured: {amino_acid: {codon: frequency}}
     adapter_5_prime (str): 5' adapter sequence.
     adapter_3_prime (str): 3' adapter sequence.
     total_length (int): Target length of the final nucleotide sequence.
@@ -54,13 +62,41 @@ def build_library(protein_sequences,
     gc_tolerance (float): Tolerance for GC content optimization. Default is 0.025.
     verify_unique_protein_sequences (bool): Whether to verify unique protein sequences. Default is True.
     verify_start_stop_codons_in_adapters (bool): Whether to verify start and stop codons in adapters. Default is False.
-    
+    add_protein_identifiers (bool): Whether to add protein identifiers to the output. Default is False.
+    protein_identifier_length (int): Length of protein identifiers. Default is 8.
+    verify_coding_sequence (bool): Whether to verify the coding sequence. Default is True.
     Returns
     -------
     '''
+    # Initialize return_dict flag
+    return_dict = False
+    
     # Check if protein_sequences is a string
     if isinstance(protein_sequences, str):
         protein_sequences = [protein_sequences]
+        if add_protein_identifiers:
+            return_dict=True
+            protein_names = generate_random_protein_ids(len(protein_sequences), protein_identifier_length)
+            protein_to_name_dict={}
+            for i, seq in enumerate(protein_sequences):
+                protein_to_name_dict[seq] = protein_names[i]
+
+    if isinstance(protein_sequences, dict):
+        # Store original dict for later reference
+        original_dict = protein_sequences.copy()
+        protein_names = list(original_dict.keys())
+        protein_sequences = list(original_dict.values())
+        protein_to_name_dict={}
+        return_dict=True
+        for i, seq in enumerate(protein_sequences):
+            protein_to_name_dict[seq] = protein_names[i]
+
+    if isinstance(protein_sequences, list) and add_protein_identifiers:
+        protein_names = generate_random_protein_ids(len(protein_sequences), protein_identifier_length)
+        protein_to_name_dict={}
+        return_dict=True
+        for i, seq in enumerate(protein_sequences):
+            protein_to_name_dict[seq] = protein_names[i]
 
     # verify unique protein sequences
     if verify_unique_protein_sequences:
@@ -110,7 +146,7 @@ def build_library(protein_sequences,
         protein_sequences = temp
 
     # optimize the sequences
-    nt_to_seq_dict = optimize_codon_usage_for_library(protein_sequences,
+    seq_to_nt_dict = optimize_codon_usage_for_library(protein_sequences,
                                                         codon_frequency_table,
                                                         gc_range=target_gc_range,
                                                         n_iter=optimization_attempts,
@@ -124,7 +160,7 @@ def build_library(protein_sequences,
     
     # see if we need to verify the coding sequence
     if verify_coding_sequence:
-        for protein, nt_seq in nt_to_seq_dict.items():
+        for protein, nt_seq in seq_to_nt_dict.items():
             if protein != translate_sequence(nt_seq, return_stop_codon=True):
                 raise ValueError(f"Protein sequence {protein} does not match nucleotide sequence {nt_seq}")
     
@@ -132,8 +168,8 @@ def build_library(protein_sequences,
     if total_length != None:
         # make new dict
         new_dict = {}
-        # iterate over nt_to_seq_dict
-        for protein, nt_seq in nt_to_seq_dict.items():
+        # iterate over seq_to_nt_dict
+        for protein, nt_seq in seq_to_nt_dict.items():
             # figure out how much padding we need to add. This will be length
             # of the nt_seq - length of 3' adapter if there is one - length of 5' adapter
             # if there is one.
@@ -174,26 +210,42 @@ def build_library(protein_sequences,
                                          avoid_added_start_codons=avoid_added_start_codons,
                                          avoid_added_stop_codons=avoid_added_stop_codons,
                                          tolerance=gc_tolerance)
-            # see if we need to verify the coding sequence
+                    
+            
+            # see if we need to verify. Do this at each sequence to fail early. 
             if verify_coding_sequence:
-                for protein, nt_seq in new_dict.items():
-                    if protein != translate_sequence(nt_seq, return_stop_codon=True):
-                        raise ValueError(f"Protein sequence {protein} does not match nucleotide sequence {nt_seq}")
-        
+                # grab protein.
+                if protein != translate_sequence(nt_seq, return_stop_codon=True):
+                    raise ValueError(f"Protein sequence {protein} does not match nucleotide sequence {nt_seq}")
+                        
+            # add nt_seq to new dict
             new_dict[protein] = nt_seq
+
+        # set seq_to_nt_dict to new dict
+        seq_to_nt_dict = new_dict
 
     # make new dict
     new_dict = {}
     # iterate over nt_to_seq_dict
-    for protein, nt_seq in nt_to_seq_dict.items():
+    for protein, nt_seq in seq_to_nt_dict.items():
         # now see if we need to add adapters
         if adapter_5_prime != None:
             nt_seq = add_5_prime_adapter(nt_seq, adapter_5_prime)
         if adapter_3_prime != None:
             nt_seq = add_3_prime_adapter(nt_seq, adapter_3_prime)
         new_dict[protein] = nt_seq
-    # make sure len new_dict is same as protein_sequences
-    if len(new_dict) != len(protein_sequences):
-        raise ValueError("Number of input protein sequences does not match number of generated nucleotide sequences")
-    return new_dict
     
+    # if we are returning a dict, format it as name:{protein_sequence:nt_sequence}
+    final_dict = {}  # Initialize final_dict
+    if return_dict:
+        for protein, nt_seq in new_dict.items():  # Fixed: iterate over new_dict instead of final_dict
+            final_dict[protein_to_name_dict[protein]] = {protein: nt_seq}
+    else:
+        final_dict = new_dict
+
+    # make sure len new_dict is same as protein_sequences
+    if len(final_dict) != len(protein_sequences):
+        raise ValueError("Number of input protein sequences does not match number of generated nucleotide sequences")
+    
+    return final_dict  # Added explicit return statement
+
