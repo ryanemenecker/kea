@@ -214,17 +214,19 @@ def add_padding(sequence, target_length, pad_location=3,
     # of the sequence, and the current GC content
     
     padding_length = target_length - len(sequence)
-    
-    # Calculate the range of possible padding GC content values
-    padding_gc_content_range = (
-        (final_GC_content_range[0] * target_length - current_gc_content * len(sequence)) / padding_length,
-        (final_GC_content_range[1] * target_length - current_gc_content * len(sequence)) / padding_length
-    )
+
+    min_effective_padding = target_length*final_GC_content_range[0]
+    max_effective_padding = target_length*final_GC_content_range[1]
+    min_effective_padding -= (current_gc_content * len(sequence))
+    max_effective_padding -= (current_gc_content * len(sequence))
+    min_effective_padding /= padding_length
+    max_effective_padding /= padding_length
+    padding_gc_content_range = (min_effective_padding, max_effective_padding)
     
     # check if any target GC content values are valid
-    if not (0 <= padding_gc_content_range[0] <= 1 and 0 <= padding_gc_content_range[1] <= 1):
-        raise ValueError("No valid target GC content values found.")
-    
+    if padding_gc_content_range[0] > 1 or padding_gc_content_range[1] < 0:
+        raise ValueError("The target GC content range is not achievable with the given sequence length.")
+
     # create the padding sequence
     padding = create_padding_sequence(
         length=target_length - len(sequence),
@@ -242,8 +244,6 @@ def add_padding(sequence, target_length, pad_location=3,
     else:
         raise ValueError("pad_location must be 5 or 3.")
     
-
-
 
 def add_padding_to_sequences(sequences, target_length, pad_location=3,
                                 final_GC_content_range=(0.35, 0.45),

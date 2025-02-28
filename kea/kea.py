@@ -2,7 +2,7 @@
 Functionality for building the library of nucleotide sequences 
 from DNA sequences
 """
-from .backend.optimize_codon_usage import optimize_codon_usage_for_library
+from .backend.optimize_codon_usage import optimize_codon_usage
 from .backend.library_generation_utils import add_padding, add_3_prime_adapter, add_5_prime_adapter
 from .backend.translation_utils import translate_sequence
 from .backend.kea_utils import generate_random_protein_ids
