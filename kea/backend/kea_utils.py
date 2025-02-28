@@ -7,53 +7,6 @@ import seaborn as sns
 import numpy as np
 from collections import defaultdict
 
-# codon to aa
-def dna_to_aa(dna_sequence):
-    """
-    Convert a DNA sequence to amino acid sequence using the codon table
-    
-    Args:
-        dna_sequence (str): DNA sequence string
-        
-    Returns:
-        str: Amino acid sequence
-    """
-    aa_sequence = ""
-    # Process DNA sequence in chunks of 3 (codons)
-    for i in range(0, len(dna_sequence), 3):
-        codon = dna_sequence[i:i+3]
-        # Skip if we don't have a complete codon
-        if len(codon) != 3:
-            break
-        # Convert codon to amino acid using the lookup table
-        aa = codons_to_aa.get(codon.upper(), 'X')
-        aa_sequence += aa
-    return aa_sequence
-
-def find_first_orf(sequence):
-    '''
-    Find the first open reading frame (ORF) in a DNA sequence.
-    parameters
-    ----------
-    sequence (str): DNA sequence string
-
-    Returns
-    --------
-    int: Start index of the first ORF, or -1 if not found.
-    '''
-    start_codon = "ATG"
-    for i in range(0, len(sequence) - 2, 3):
-        codon = sequence[i:i+3]
-        if codon == start_codon:
-            return i
-    return -1
-
-
-
-def calc_gc_content(sequence):
-    gc_count = sequence.count('G') + sequence.count('C')
-    return gc_count / len(sequence)
-
 
 def read_fasta(path_to_file):
     '''
@@ -191,4 +144,3 @@ def get_restriction_enzymes(path_to_file):
         print(f"Error reading restriction enzymes: {str(e)}")
         return None
     
-print(get_restriction_enzymes('/Users/ryanemenecker/Desktop/lab_packages/kea/kea/data/restriction_enzymes.txt'))

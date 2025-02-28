@@ -5,6 +5,8 @@ addinging in additional padded sequences to get to a specific
 length, and more. 
 '''
 import random
+from kea.backend.optimize_codon_usage import _calculate_gc_content as calc_gc_content
+from kea.data.aa_codon_conversions import codons_to_aa, aa_to_codons
 
 
 def add_5_prime_adapter(sequence, adapter_sequence):
@@ -52,24 +54,132 @@ def generate_barcode_sequences(num_barcodes, length,
     """
     pass
 
-def check_for_restriction_site(sequence, restriction_site):
+def create_padding_sequence(length,
+                            GC_content_target,
+                            tolerance,
+                            avoid_start_codon=True,
+                            avoid_stop_codon=True,
+                            avoid_adding=None, 
+                            max_attempts=2000):
     """
-    Check if a restriction site is present in the sequence.
+    Create the padding sequence.
+    This is useful for libraries that need to be a fixed size
+    but have different lengths of coding sequences.
 
     Parameters
     ----------
-    sequence : str
-        The DNA sequence to check.
-    restriction_site : str
-        The restriction site to look for.
+    length : int
+        Length of the padding sequence.
+    GC_content_target : float
+        Target GC content for the padding sequence.
+    tolerance : float
+        Tolerance for the GC content.
+    avoid_start_codon : bool
+        If True, avoid creating a start codon.
+    avoid_stop_codon : bool
+        If True, avoid creating a stop codon.
+    avoid_adding : list of str
+        List of sequences to avoid adding.
+        Will check for presence of these sequences in the padding.
+        Will not return any padding with these sequences.
+    max_attempts : int
+        Maximum number of attempts to generate a valid padding sequence.
     """
-    return restriction_site in sequence
+    # Define start and stop codons to avoid
+    start_codons = ["ATG"]
+    stop_codons = ["TAA", "TAG", "TGA"]
 
-def add_padding(sequence, target_length, pad_location=3, 
-                final_GC_content_range = (0.35, 0.45),
+    # Set avoid_adding to empty list if None
+    if avoid_adding is None:
+        avoid_adding = []
+    if isinstance(avoid_adding, str):
+        avoid_adding = [avoid_adding]
+
+    # Define nucleotide weights to achieve target GC content
+    gc_weight = GC_content_target / 2  # Split between G and C
+    at_weight = (1 - GC_content_target) / 2  # Split between A and T
+    nucleotide_weights = {'G': gc_weight, 'C': gc_weight, 
+                        'A': at_weight, 'T': at_weight}
+    
+    # Define alternative bases to replace problematic codons
+    # These maintain similar GC content when possible
+    replacements = {
+        'A': ['T', 'C', 'G'],
+        'T': ['A', 'C', 'G'],
+        'G': ['C', 'A', 'T'],
+        'C': ['G', 'A', 'T']
+    }
+    
+    for attempt in range(max_attempts):
+        # Generate a random padding sequence
+        padding = ''.join(random.choices(
+            list(nucleotide_weights.keys()),
+            weights=list(nucleotide_weights.values()),
+            k=length
+        ))
+        
+        # Check GC content
+        gc_content = calc_gc_content(padding)
+        if abs(gc_content - GC_content_target) > tolerance:
+            continue
+        
+        # Convert to list for easier modification
+        padding_list = list(padding)
+        modified = False
+        
+        # Fix start codons by replacing the first base of each codon
+        if avoid_start_codon:
+            for i in range(0, len(padding_list) - 2):
+                codon = ''.join(padding_list[i:i+3])
+                if codon in start_codons:
+                    # Choose a replacement that isn't 'A' for the first position of ATG
+                    replacement = random.choice([b for b in ['T', 'C', 'G'] if b != padding_list[i]])
+                    padding_list[i] = replacement
+                    modified = True
+        
+        # Fix stop codons by replacing the middle base of each codon
+        if avoid_stop_codon:
+            for i in range(0, len(padding_list) - 2):
+                codon = ''.join(padding_list[i:i+3])
+                if codon in stop_codons:
+                    # Replace middle base (most effective for breaking stop codons)
+                    replacement = random.choice([b for b in ['A', 'T', 'C', 'G'] if b != padding_list[i+1]])
+                    padding_list[i+1] = replacement
+                    modified = True
+        
+        # If modifications were made, reassemble the sequence and recheck GC content
+        if modified:
+            padding = ''.join(padding_list)
+            gc_content = calc_gc_content(padding)
+            if abs(gc_content - GC_content_target) > tolerance:
+                continue
+        
+        # Check for sequences to avoid - can't easily modify these in place
+        # so we'll still reject sequences containing them
+        if any(seq in padding for seq in avoid_adding):
+            continue
+        
+        # Double check no start/stop codons were missed or created during modifications
+        if avoid_start_codon and any(codon in padding for codon in start_codons):
+            continue
+            
+        if avoid_stop_codon and any(codon in padding for codon in stop_codons):
+            continue
+        
+        # If all checks pass, return the padding sequence
+        return padding
+
+    # If no valid padding sequence is found after max attempts
+    raise ValueError(f"Could not generate a suitable padding sequence after {max_attempts} attempts. "
+                    f"Consider relaxing constraints or increasing the tolerance.")
+
+
+def add_padding(sequence, target_length, pad_location=3,
+                final_GC_content_range=(0.35, 0.45),
                 avoid_added_start_codons=True,
                 avoid_added_stop_codons=True,
-                num_attempts=1000):
+                num_attempts=1000,
+                tolerance=0.02):
     """
     Add padding to a DNA sequence to reach a target length.
     The padding can be added to the 5' or 3' end of the sequence.
@@ -92,66 +202,54 @@ def add_padding(sequence, target_length, pad_location=3,
         If True, avoid adding padding that creates a new stop codon.
     num_attempts : int
         The number of attempts to find suitable padding.
+    tolerance : float
+        The tolerance for the GC content.
     """
-    # Calculate the number of bases to add
-    num_bases_to_add = target_length - len(sequence)
-    if num_bases_to_add <= 0:
-        return sequence
-        
-    # Define start and stop codons to avoid
-    start_codons = ["ATG"]
-    stop_codons = ["TAA", "TAG", "TGA"]
+    # calculate current sequence GC content
+    current_gc_content = calc_gc_content(sequence)
+    # calculate possible target_GC content values
+    # based on the length of the padding, the length
+    # of the sequence, and the current GC content
+    possible_target_GC_content_values = []
+    for target_GC_content in [final_GC_content_range[0], final_GC_content_range[1]]:
+        # calculate the length of the padding
+        padding_length = target_length - len(sequence)
+        # calculate the GC content of the padding
+        padding_gc_content = (target_GC_content * target_length - current_gc_content * len(sequence)) / padding_length
+        # check if the padding GC content is valid
+        if 0 <= padding_gc_content <= 1:
+            possible_target_GC_content_values.append(padding_gc_content)
+    # check if any target GC content values are valid
+    if not possible_target_GC_content_values:
+        raise ValueError("No valid target GC content values found.")
+    # choose a random target GC content value
+    target_gc_content = random.choice(possible_target_GC_content_values)
+    # create the padding sequence
+    padding = create_padding_sequence(
+        length=target_length - len(sequence),
+        GC_content_target=target_gc_content,
+        tolerance=tolerance,
+        avoid_start_codon=avoid_added_start_codons,
+        avoid_stop_codon=avoid_added_stop_codons,
+        max_attempts=num_attempts
+    )
+    # add the padding to the sequence
+    if pad_location == 5:
+        return padding + sequence
+    elif pad_location == 3:
+        return sequence + padding
+    else:
+        raise ValueError("pad_location must be 5 or 3.")
     
-    min_gc, max_gc = final_GC_content_range
-    
-    for _ in range(num_attempts):
-        # Generate random padding
-        bases = ['A', 'T', 'G', 'C']
-        padding = ''.join(random.choice(bases) for _ in range(num_bases_to_add))
-        
-        # Create the candidate sequence with padding
-        if pad_location == 5:
-            candidate = padding + sequence
-            junction = padding[-2:] + sequence[:1] if len(padding) >= 2 else padding + sequence[:1]
-        else:  # pad_location == 3
-            candidate = sequence + padding
-            junction = sequence[-2:] + padding[:1] if len(sequence) >= 2 else sequence + padding[:1]
-        
-        # Check GC content
-        gc_count = sum(1 for base in candidate if base in ['G', 'C'])
-        gc_content = gc_count / len(candidate)
-        
-        if not (min_gc <= gc_content <= max_gc):
-            continue
-        
-        # Check for unwanted start/stop codons at the junction
-        valid_padding = True
-        
-        if avoid_added_start_codons:
-            for i in range(len(junction) - 2):
-                if junction[i:i+3] in start_codons:
-                    valid_padding = False
-                    break
-                    
-        if valid_padding and avoid_added_stop_codons:
-            for i in range(len(junction) - 2):
-                if junction[i:i+3] in stop_codons:
-                    valid_padding = False
-                    break
-        
-        # If we've found valid padding, return the result
-        if valid_padding:
-            return candidate
-    
-    # if no valid padding was found, raise exception
-    raise ValueError("No valid padding found after maximum attempts.")
+
 
 
 def add_padding_to_sequences(sequences, target_length, pad_location=3,
                                 final_GC_content_range=(0.35, 0.45),
                                 avoid_added_start_codons=True,
                                 avoid_added_stop_codons=True,
-                                num_attempts=1000):
+                                num_attempts=1000,
+                                tolerance=0.02):
         """
         Add padding to a list of DNA sequences to reach a target length.
         The padding can be added to the 5' or 3' end of the sequence.
@@ -174,11 +272,13 @@ def add_padding_to_sequences(sequences, target_length, pad_location=3,
             If True, avoid adding padding that creates a new stop codon.
         num_attempts : int
             The number of attempts to find suitable padding.
+        tolerance : float
+            The tolerance for the GC content.
         """
         return [add_padding(seq, target_length, pad_location, 
                             final_GC_content_range,
                             avoid_added_start_codons,
                             avoid_added_stop_codons,
-                            num_attempts) for seq in sequences]
+                            num_attempts, tolerance=tolerance) for seq in sequences]
 
 

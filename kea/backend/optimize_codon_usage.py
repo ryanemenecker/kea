@@ -105,7 +105,7 @@ def optimize_codon_usage(amino_acid_sequence,
                          return_best=True,
                          early_stop_threshold=0.95,
                          fine_tuning_iterations=500,
-                         minimum_codon_probability=0.06,
+                         minimum_codon_probability=None,
                          show_progress_bar=True):
     '''
     Optimize codon usage for a given amino acid sequence.
@@ -158,19 +158,20 @@ def optimize_codon_usage(amino_acid_sequence,
         raise ValueError("Invalid GC range")
     
     # see if there are any codons that are below the minimum probability
-    del_vals={}
-    for aa in codon_frequency_table:
-        for codon in codon_frequency_table[aa]:
-            if codon_frequency_table[aa][codon] < minimum_codon_probability:
-                if aa not in del_vals:
-                    del_vals[aa]=[]
-                del_vals[aa].append(codon)
-    # remove those codons from the table
-    for aa in del_vals:
-        for codon in del_vals[aa]:
-            del codon_frequency_table[aa][codon]
-            # remove the codon from aa_to_codons
-            aa_to_codons[aa].remove(codon)
+    if minimum_codon_probability is not None:
+        del_vals={}
+        for aa in codon_frequency_table:
+            for codon in codon_frequency_table[aa]:
+                if codon_frequency_table[aa][codon] < minimum_codon_probability:
+                    if aa not in del_vals:
+                        del_vals[aa]=[]
+                    del_vals[aa].append(codon)
+        # remove those codons from the table
+        for aa in del_vals:
+            for codon in del_vals[aa]:
+                del codon_frequency_table[aa][codon]
+                # remove the codon from aa_to_codons
+                aa_to_codons[aa].remove(codon)
 
     # Pre-calculate codon GC content
     codon_gc_content = {codon: (codon.count('G') + codon.count('C'))/3 
@@ -231,7 +232,7 @@ def optimize_codon_usage(amino_acid_sequence,
         'target_gc': target_gc
     }
     if show_progress_bar:
-        pbar_inner = tqdm(total=n_iter, position=1, desc='Current sequence optimization', leave=False)
+        pbar_inner = tqdm(total=n_iter, position=1, desc='Current sequence optimization', leave=True)
     for i in range(n_iter):
         stats['iterations'] += 1
         sequence = _build_sequence(amino_acid_sequence, aa_weights)
@@ -299,9 +300,11 @@ def optimize_codon_usage_for_library(
         return_best=True,
         early_stop_threshold=0.95,
         fine_tuning_iterations=500,
-        minimum_codon_probability=0.06,
+        minimum_codon_probability=None,
         return_statistics=False,
-        show_progress_bar=True): 
+        show_progress_bar=True,
+        show_optimization_progress=False,
+        return_protien_nucleotide_dict=True): 
     '''
     Optimize codon usage for a list of amino acid sequences.
     Parameters
@@ -335,6 +338,10 @@ def optimize_codon_usage_for_library(
         If False, return only the optimized sequences.
     show_progress_bar : bool
         If True, show a progress bar for the optimization process.
+    show_optimization_progress : bool
+        If True, show a progress bar for the optimization process.
+    return_protien_nucleotide_dict : bool
+        If True, return a dictionary of protein sequences to nucleotide sequences.
 
     Returns
     -------
@@ -345,10 +352,11 @@ def optimize_codon_usage_for_library(
     '''
     optimized_sequences = []
     stats_list = []
+    protein_to_nucleotide_dict = {}
     # Shoutout to Alex Holehouse for the progress bar magic. 
     if show_progress_bar:
         pbar=tqdm(total=len(list_of_sequences), position=0, desc='Progress through sequences', leave=True)
-    for sequence in tqdm(list_of_sequences):
+    for sequence in list_of_sequences:
         optimized_sequence, stats = optimize_codon_usage(
             sequence,
             codon_frequency_table,
@@ -360,16 +368,20 @@ def optimize_codon_usage_for_library(
             early_stop_threshold=early_stop_threshold,
             fine_tuning_iterations=fine_tuning_iterations,
             minimum_codon_probability=minimum_codon_probability,
-            show_progress_bar=show_progress_bar
+            show_progress_bar=show_optimization_progress
         )
         optimized_sequences.append(optimized_sequence)
         stats_list.append(stats)
+        if return_protien_nucleotide_dict:
+            protein_to_nucleotide_dict[sequence]=optimized_sequence
         # update if we are using a progress bar
         if show_progress_bar:
             pbar.update(1)
     # make sure to close progress bar
     if show_progress_bar:
         pbar.close()
+    if return_protien_nucleotide_dict:
+        return protein_to_nucleotide_dict
     if return_statistics:
         return optimized_sequences, stats_list
     else:

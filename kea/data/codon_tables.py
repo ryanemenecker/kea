@@ -78,5 +78,9 @@ s288c_unweighted={
     'Y': {'TAT': 0.5665, 'TAC': 0.4335}
 }
 
-
-
+# add codon tables here. 
+all_codon_tables={
+    'yeast': yeast_codon_usage,
+    's288c': s288c_codon_usage,
+    's288c_unweighted': s288c_unweighted
+}
