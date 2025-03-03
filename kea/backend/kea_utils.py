@@ -31,6 +31,7 @@ def read_fasta(path_to_file):
     
     return sequences
 
+
 def make_codon_table(sequences, require_start_codon=False):
     '''
     function that makes a codon table from a sequence or sequences
@@ -75,7 +76,8 @@ def make_codon_table(sequences, require_start_codon=False):
             codon_usage[aa][codon] = round(freq, 5)
     return codon_usage    
 
-def calculate_codon_usage_table(path_to_file, require_start_codon=True):
+
+def codon_from_fasta(path_to_file, require_start_codon=True):
     '''
     Calculate codon usage frequencies from coding sequences in a FASTA file.
     
@@ -107,7 +109,6 @@ def calculate_codon_usage_table(path_to_file, require_start_codon=True):
         
         codon_table = make_codon_table(final_sequences, require_start_codon=require_start_codon)
         return codon_table
-
         
     except FileNotFoundError:
         print(f"Error: File not found: {path_to_file}")
@@ -196,3 +197,4 @@ def generate_random_protein_ids(length_of_id,
         unique_ids.add(new_id)
     
     return list(unique_ids)
+

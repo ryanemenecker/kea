@@ -9,51 +9,6 @@ from kea.backend.optimize_codon_usage import _calculate_gc_content as calc_gc_co
 from kea.data.aa_codon_conversions import codons_to_aa, aa_to_codons
 
 
-def add_5_prime_adapter(sequence, adapter_sequence):
-    """
-    Add a 5' adapter sequence to the DNA sequence.
-    
-    Args:
-        sequence (str): The original DNA sequence.
-        adapter_sequence (str): The adapter sequence to add.
-        
-    Returns:
-        str: The DNA sequence with the 5' adapter added.
-    """
-    return adapter_sequence + sequence
-
-def add_3_prime_adapter(sequence, adapter_sequence):
-    """
-    Add a 3' adapter sequence to the DNA sequence.
-    
-    Args:
-        sequence (str): The original DNA sequence.
-        adapter_sequence (str): The adapter sequence to add.
-        
-    Returns:
-        str: The DNA sequence with the 3' adapter added.
-    """
-    return sequence + adapter_sequence
-
-def generate_barcode_sequences(num_barcodes, length, 
-                               GC_content_range=(0.35, 0.45),
-                               max_barcode_similarity=0.5):
-    """
-    Generate a list of unique barcode sequences.
-
-    Parameters
-    ----------
-    num_barcodes : int
-        The number of unique barcodes to generate.
-    length : int
-        The length of each barcode.
-    GC_content_range : tuple of float
-        The range of GC content for the barcodes.
-    max_barcode_similarity : float
-        The maximum similarity allowed between barcodes.
-    """
-    pass
-
 def create_padding_sequence(length,
                             GC_content_range, # changed from GC_content_target to GC_content_range
                             tolerance,
@@ -176,12 +131,16 @@ def create_padding_sequence(length,
                     f"Consider relaxing constraints or increasing the tolerance.")
 
 
-def add_padding(sequence, target_length, pad_location=3,
-                final_GC_content_range=(0.35, 0.45),
-                avoid_added_start_codons=True,
-                avoid_added_stop_codons=True,
-                num_attempts=1000,
-                tolerance=0.02):
+def add_padding(current_gc_content,
+                padding_length,
+                target_length,
+                current_length,
+                final_gc_range,
+                avoid_adding_start_codons,
+                avoid_adding_stop_codons,
+                num_attempts=5000,
+                tolerance=0.02,
+                return_best=True):
     """
     Add padding to a DNA sequence to reach a target length.
     The padding can be added to the 5' or 3' end of the sequence.
@@ -190,96 +149,76 @@ def add_padding(sequence, target_length, pad_location=3,
 
     Parameters
     ----------
-    sequence : str
-        The original DNA sequence.
+    current_gc_content : float
+        The current GC content of the DNA sequence.
+    padding_length : int
+        The length of the padding to add.
     target_length : int
-        The desired length of the final sequence.
-    pad_location : int
-        The location to add padding: 5' (5) or 3' (3).
-    final_GC_content_range : tuple of float
-        The range of GC content for the final sequence.
-    avoid_added_start_codons : bool
-        If True, avoid adding padding that creates a new start codon.
-    avoid_added_stop_codons : bool
-        If True, avoid adding padding that creates a new stop codon.
+        The target length of the final DNA sequence.
+    final_gc_range : tuple of float
+        The target GC content range for the final sequence.
     num_attempts : int
         The number of attempts to find suitable padding.
     tolerance : float
         The tolerance for the GC content.
+    return_best : bool
+        If True, return the best sequence even if it's outside the GC range.
+
     """
-    # calculate current sequence GC content
-    current_gc_content = calc_gc_content(sequence)
     # calculate possible target_GC content values
     # based on the length of the padding, the length
     # of the sequence, and the current GC content
+    total_length = current_length + padding_length
     
-    padding_length = target_length - len(sequence)
+    # Calculate required GC content in padding to achieve final GC range
+    min_gc_in_padding = (final_gc_range[0] * total_length - current_gc_content * current_length) / padding_length
+    max_gc_in_padding = (final_gc_range[1] * total_length - current_gc_content * current_length) / padding_length
+    padding_gc_content_range = (min_gc_in_padding, max_gc_in_padding)
 
-    min_effective_padding = target_length*final_GC_content_range[0]
-    max_effective_padding = target_length*final_GC_content_range[1]
-    min_effective_padding -= (current_gc_content * len(sequence))
-    max_effective_padding -= (current_gc_content * len(sequence))
-    min_effective_padding /= padding_length
-    max_effective_padding /= padding_length
-    padding_gc_content_range = (min_effective_padding, max_effective_padding)
     
     # check if any target GC content values are valid
-    if padding_gc_content_range[0] > 1 or padding_gc_content_range[1] < 0:
-        raise ValueError("The target GC content range is not achievable with the given sequence length.")
+    if return_best==False:
+        if padding_gc_content_range[0] > 1 or padding_gc_content_range[1] < 0:
+            raise ValueError("The target GC content range is not achievable with the given sequence length.")
+
+    if padding_gc_content_range[0] < 0:
+        padding_gc_content_range = (0, padding_gc_content_range[1])
+        if padding_gc_content_range[1] < 0:
+            padding_gc_content_range = (0, 0+(tolerance*3))
+    if padding_gc_content_range[1] > 1:
+        padding_gc_content_range = (padding_gc_content_range[0], 1)
+        if padding_gc_content_range[0] > 1:
+            padding_gc_content_range = (1-(tolerance*3), 1)
+    
+
 
     # create the padding sequence
     padding = create_padding_sequence(
-        length=target_length - len(sequence),
+        length=padding_length,
         GC_content_range=padding_gc_content_range, # pass the range to create_padding_sequence
         tolerance=tolerance,
-        avoid_start_codon=avoid_added_start_codons,
-        avoid_stop_codon=avoid_added_stop_codons,
+        avoid_start_codon=avoid_adding_start_codons,
+        avoid_stop_codon=avoid_adding_stop_codons,
         max_attempts=num_attempts
     )
-    # add the padding to the sequence
-    if pad_location == 5:
-        return padding + sequence
-    elif pad_location == 3:
-        return sequence + padding
-    else:
-        raise ValueError("pad_location must be 5 or 3.")
-    
-
-def add_padding_to_sequences(sequences, target_length, pad_location=3,
-                                final_GC_content_range=(0.35, 0.45),
-                                avoid_added_start_codons=True,
-                                avoid_added_stop_codons=True,
-                                num_attempts=1000,
-                                tolerance=0.02):
-        """
-        Add padding to a list of DNA sequences to reach a target length.
-        The padding can be added to the 5' or 3' end of the sequence.
-        The padding is designed to avoid creating new start or stop codons,
-        and to keep the GC content within a specified range.
-    
-        Parameters
-        ----------
-        sequences : list of str
-            The original DNA sequences.
-        target_length : int
-            The desired length of the final sequences.
-        pad_location : int
-            The location to add padding: 5' (5) or 3' (3).
-        final_GC_content_range : tuple of float
-            The range of GC content for the final sequences.
-        avoid_added_start_codons : bool
-            If True, avoid adding padding that creates a new start codon.
-        avoid_added_stop_codons : bool
-            If True, avoid adding padding that creates a new stop codon.
-        num_attempts : int
-            The number of attempts to find suitable padding.
-        tolerance : float
-            The tolerance for the GC content.
-        """
-        return [add_padding(seq, target_length, pad_location, 
-                            final_GC_content_range,
-                            avoid_added_start_codons,
-                            avoid_added_stop_codons,
-                            num_attempts, tolerance=tolerance) for seq in sequences]
+    return padding
 
 
+def generate_barcode_sequences(num_barcodes, length, 
+                               GC_content_range=(0.35, 0.45),
+                               max_barcode_similarity=0.5):
+    """
+    Generate a list of unique barcode sequences.
+
+    Parameters
+    ----------
+    num_barcodes : int
+        The number of unique barcodes to generate.
+    length : int
+        The length of each barcode.
+    GC_content_range : tuple of float
+        The range of GC content for the barcodes.
+    max_barcode_similarity : float
+        The maximum similarity allowed between barcodes.
+    """
+    pass

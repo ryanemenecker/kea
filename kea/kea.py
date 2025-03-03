@@ -2,24 +2,32 @@
 Functionality for building the library of nucleotide sequences 
 from DNA sequences
 """
+import os
+from tqdm import tqdm
+
+from .backend.codon_table import CodonTable
 from .backend.optimize_codon_usage import optimize_codon_usage
-from .backend.library_generation_utils import add_padding, add_3_prime_adapter, add_5_prime_adapter
 from .backend.translation_utils import translate_sequence
 from .backend.kea_utils import generate_random_protein_ids
+from .backend.sequence import Sequence
 from .data.codon_tables import all_codon_tables
+
+
 
 def build_library(protein_sequences,
                   codon_frequency_table,
                   adapter_5_prime=None,
                   adapter_3_prime=None,
                   total_length=None,
-                  force_start_codon=False,
-                  force_stop_codon=False,
+                  force_start_codon=True,
+                  force_stop_codon=True,
                   target_gc_range=None,
                   pad_location=None,
-                  avoid_added_start_codons=True,
-                  avoid_added_stop_codons=True,
-                  optimization_attempts=1000,
+                  avoid_adding_start_codons=True,
+                  avoid_adding_stop_codons=True,
+                  optimization_attempts=5000,
+                  gc_finetuning_iterations=2000,
+                  padding_attempts=10000,
                   gc_weight=1,
                   codon_weight=1,
                   verify_coding_sequence=True,
@@ -30,7 +38,8 @@ def build_library(protein_sequences,
                   verify_start_stop_codons_in_adapters=False,
                   show_optimization_progress=True,
                   add_protein_identifiers=False,
-                  protein_identifier_length=8):
+                  protein_identifier_length=8,
+                  return_best=False):
     '''
     Function to build a library of nucleotide sequences from a list of protein sequences.
     The function will add adapters, padding, and optimize for GC content and codon usage.
@@ -54,6 +63,7 @@ def build_library(protein_sequences,
     avoid_added_start_codons (bool): Whether to avoid added start codons.
     avoid_added_stop_codons (bool): Whether to avoid added stop codons.
     optimization_attempts (int): Number of attempts for optimization.
+    gc_finetuning_iterations (int): Number of iterations for fine-tuning GC content after main optimization.
     gc_weight (float): Weight for GC content optimization.
     codon_weight (float): Weight for codon usage optimization.
     minimum_codon_probability (float): Minimum codon probability for optimization.
@@ -68,184 +78,289 @@ def build_library(protein_sequences,
     Returns
     -------
     '''
-    # Initialize return_dict flag
-    return_dict = False
-    
+
+    # get sequences as a list and names as a list
     # Check if protein_sequences is a string
     if isinstance(protein_sequences, str):
-        protein_sequences = [protein_sequences]
+        sequences = [protein_sequences]
+        names = generate_random_protein_ids(protein_identifier_length, 1)
+    elif isinstance(protein_sequences, list):
         if add_protein_identifiers:
-            return_dict=True
-            protein_names = generate_random_protein_ids(len(protein_sequences), protein_identifier_length)
-            protein_to_name_dict={}
-            for i, seq in enumerate(protein_sequences):
-                protein_to_name_dict[seq] = protein_names[i]
+            names = generate_random_protein_ids(protein_identifier_length, len(protein_sequences))
+        else:
+            names = [f"Protein_{i}" for i in range(len(protein_sequences))]
+        sequences=protein_sequences
+    elif isinstance(protein_sequences, dict):
+        names = list(protein_sequences.keys())
+        sequences = list(protein_sequences.values())
+    else:
+        raise ValueError("protein_sequences must be a string, list, or dict.")
 
-    if isinstance(protein_sequences, dict):
-        # Store original dict for later reference
-        original_dict = protein_sequences.copy()
-        protein_names = list(original_dict.keys())
-        protein_sequences = list(original_dict.values())
-        protein_to_name_dict={}
-        return_dict=True
-        for i, seq in enumerate(protein_sequences):
-            protein_to_name_dict[seq] = protein_names[i]
-
-    if isinstance(protein_sequences, list) and add_protein_identifiers:
-        protein_names = generate_random_protein_ids(len(protein_sequences), protein_identifier_length)
-        protein_to_name_dict={}
-        return_dict=True
-        for i, seq in enumerate(protein_sequences):
-            protein_to_name_dict[seq] = protein_names[i]
-
+    # make sure names and sequences are the same length
+    if len(names) != len(sequences):
+        raise ValueError("Number of protein sequences does not equal to number of portein names..")
+    
     # verify unique protein sequences
     if verify_unique_protein_sequences:
-        if len(protein_sequences) != len(set(protein_sequences)):
+        if len(sequences) != len(set(sequences)):
             raise ValueError("Protein sequences are not unique.")
     
-    # verify start and stop codons in adapters
-    if verify_start_stop_codons_in_adapters:
-        if adapter_5_prime != None:
-            if adapter_5_prime[-3:] != 'ATG':
-                raise ValueError("5' adapter does not have start codon.")
-        if adapter_3_prime != None:
-            if adapter_3_prime[:3] not in ['TAA', 'TAG', 'TGA']:
-                raise ValueError("3' adapter does not have stop codon.")
-    
+
     # check codon_frequency_table
     if isinstance(codon_frequency_table, str):
         # make sure is lowercase
-        codon_frequency_table= codon_frequency_table.lower()
+        codon_frequency_table = codon_frequency_table.lower()
         if codon_frequency_table not in all_codon_tables:
             raise ValueError(f"Codon frequency table {codon_frequency_table} not found.")
         else:
             codon_frequency_table = all_codon_tables[codon_frequency_table]
     elif not isinstance(codon_frequency_table, dict):
         raise ValueError("Codon frequency table must be a string or a dictionary.")
-
     
+
+    # verify start and stop codons in adapters
+    if verify_start_stop_codons_in_adapters:
+        if adapter_5_prime != None:
+            if adapter_5_prime[-3:] != 'ATG':
+                raise ValueError("5' adapter does not have start codon.")
+            # check for no nucleotides in adapters.
+            if len(set(adapter_5_prime) - set(['A', 'T', 'G', 'C'])) > 0:
+                raise ValueError("5' adapter has non-nucleotide characters.")
+        else:
+            adapter_5_prime=""
+        if adapter_3_prime != None:
+            if adapter_3_prime[:3] not in ['TAA', 'TAG', 'TGA']:
+                raise ValueError("3' adapter does not have stop codon.")
+            # check for no nucleotides in adapters.
+            if len(set(adapter_3_prime) - set(['A', 'T', 'G', 'C'])) > 0:
+                raise ValueError("3' adapter has non-nucleotide characters.")
+        else:
+            adapter_3_prime=""
+    if adapter_3_prime==None:
+        adapter_3_prime=""
+    if adapter_5_prime==None:
+        adapter_5_prime=""
+
+    # make sure total_length is an int
+    if total_length != None:
+        # make sure specified total length is possible given the sequences and adapters
+        if not isinstance(total_length, int):
+            raise ValueError("total_length must be an integer.")
+        if total_length <= 0:
+            raise ValueError("total_length must be greater than 0.")        
+        # get the longest sequence in sequences
+        longest_sequence = max(sequences, key=len)
+        # see if total length is possible given the longest sequence, three nucleotides
+        # per amino acid, and the adapters.
+        min_total_length = len(longest_sequence) * 3
+        min_total_length += len(adapter_5_prime)
+        min_total_length += len(adapter_3_prime)
+        if total_length < min_total_length:
+            raise ValueError(f"Total length {total_length} is less than minimum length {min_total_length} given the sequences and adapters.")
+
     # if target_gc_range is None, set to (0,1)
     if target_gc_range is None:
-        target_gc_range = (0,1)
-    
-    # see if we need to add start codon
-    if force_start_codon:
-        temp=[]
-        for seq in protein_sequences:
-            if seq[0] != 'M':
-                seq = 'M' + seq
-            temp.append(seq)
-        protein_sequences = temp
-    # see if we need to add stop codon
-    if force_stop_codon:
-        temp=[]
-        for seq in protein_sequences:
-            if seq[-1] != '*':
-                seq = seq + '*'
-            temp.append(seq)
-        protein_sequences = temp
+        target_gc_range = (0,1)    
 
-    # optimize the sequences
-    seq_to_nt_dict = optimize_codon_usage_for_library(protein_sequences,
-                                                        codon_frequency_table,
-                                                        gc_range=target_gc_range,
-                                                        n_iter=optimization_attempts,
-                                                        gc_weight=gc_weight,
-                                                        usage_weight=codon_weight, 
-                                                        return_best=True,
-                                                        minimum_codon_probability=minimum_codon_probability,
-                                                        show_progress_bar=show_progress,
-                                                        return_protien_nucleotide_dict=True,
-                                                        show_optimization_progress=show_optimization_progress)
+    # make sure target_gc_range is a tuple and between 0 and 1
+    if not isinstance(target_gc_range, tuple):
+        raise ValueError("target_gc_range must be a tuple.")
+    if target_gc_range[0] < 0 or target_gc_range[0] > 1:
+        raise ValueError("target_gc_range must be between 0 and 1.")
+    if target_gc_range[1] < 0 or target_gc_range[1] > 1:
+        raise ValueError("target_gc_range must be between 0 and 1.")
     
-    # see if we need to verify the coding sequence
-    if verify_coding_sequence:
-        for protein, nt_seq in seq_to_nt_dict.items():
-            if protein != translate_sequence(nt_seq, return_stop_codon=True):
-                raise ValueError(f"Protein sequence {protein} does not match nucleotide sequence {nt_seq}")
-    
-    # now see if we need to add padding. 
-    if total_length != None:
-        # make new dict
-        new_dict = {}
-        # iterate over seq_to_nt_dict
-        for protein, nt_seq in seq_to_nt_dict.items():
-            # figure out how much padding we need to add. This will be length
-            # of the nt_seq - length of 3' adapter if there is one - length of 5' adapter
-            # if there is one.
-            if adapter_3_prime!=None:
-                adapter_3_prime_length = len(adapter_3_prime)
-            else:
-                adapter_3_prime_length = 0
-            if adapter_5_prime!=None:
-                adapter_5_prime_length = len(adapter_5_prime)
-            else:
-                adapter_5_prime_length = 0
-            padding_length = total_length - len(nt_seq) - adapter_3_prime_length - adapter_5_prime_length
-            # if padding length is less than 0, raise error
-            if padding_length < 0:
-                raise ValueError(f"Total length {total_length} is less than length of nucleotide sequence {nt_seq}")
-            # if padding length is greater than 0...
-            if padding_length > 0:
-                # if pad_location is None, add padding to each end. 
-                if pad_location == None:
-                    # figure out length of 5' padding
-                    five_prime_padding_length = padding_length // 2
-                    three_prime_padding_length = padding_length - five_prime_padding_length
-                    # add padding to each end
-                    nt_seq = add_padding(nt_seq, len(nt_seq)+five_prime_padding_length, 
-                                         pad_location=5,
-                                         avoid_added_start_codons=avoid_added_start_codons,
-                                         avoid_added_stop_codons=avoid_added_stop_codons,
-                                         tolerance=gc_tolerance)
-                    nt_seq = add_padding(nt_seq, len(nt_seq)+three_prime_padding_length,    
-                                         pad_location=3,
-                                         avoid_added_start_codons=avoid_added_start_codons,
-                                         avoid_added_stop_codons=avoid_added_stop_codons,
-                                         tolerance=gc_tolerance)
-                else:
-                    # add padding to specified location
-                    nt_seq = add_padding(nt_seq, len(nt_seq)+padding_length, 
-                                         pad_location=pad_location,
-                                         avoid_added_start_codons=avoid_added_start_codons,
-                                         avoid_added_stop_codons=avoid_added_stop_codons,
-                                         tolerance=gc_tolerance)
-                    
-            
-            # see if we need to verify. Do this at each sequence to fail early. 
-            if verify_coding_sequence:
-                # grab protein.
-                if protein != translate_sequence(nt_seq, return_stop_codon=True):
-                    raise ValueError(f"Protein sequence {protein} does not match nucleotide sequence {nt_seq}")
-                        
-            # add nt_seq to new dict
-            new_dict[protein] = nt_seq
+    # make sure pad_location is None or an int
+    if pad_location != None:
+        if pad_location not in [3, 5]:
+            raise ValueError("pad_location must be 3 or 5.")
 
-        # set seq_to_nt_dict to new dict
-        seq_to_nt_dict = new_dict
+    # make sure avoid_added_start codons is a bool
+    if not isinstance(avoid_adding_start_codons, bool):
+        raise ValueError("avoid_added_start_codons must be a boolean.")
 
-    # make new dict
-    new_dict = {}
-    # iterate over nt_to_seq_dict
-    for protein, nt_seq in seq_to_nt_dict.items():
-        # now see if we need to add adapters
-        if adapter_5_prime != None:
-            nt_seq = add_5_prime_adapter(nt_seq, adapter_5_prime)
-        if adapter_3_prime != None:
-            nt_seq = add_3_prime_adapter(nt_seq, adapter_3_prime)
-        new_dict[protein] = nt_seq
+    # make sure avoid_added_stop codons is a bool
+    if not isinstance(avoid_adding_stop_codons, bool):
+        raise ValueError("avoid_added_stop_codons must be a boolean.")
+
+    # make sure optimization_attempts is an int
+    if not isinstance(optimization_attempts, int):
+        raise ValueError("optimization_attempts must be an integer.")
     
-    # if we are returning a dict, format it as name:{protein_sequence:nt_sequence}
-    final_dict = {}  # Initialize final_dict
-    if return_dict:
-        for protein, nt_seq in new_dict.items():  # Fixed: iterate over new_dict instead of final_dict
-            final_dict[protein_to_name_dict[protein]] = {protein: nt_seq}
+    # make sure optimization_attempts is greater than 0
+    if optimization_attempts <= 0:
+        raise ValueError("optimization_attempts must be greater than 0.")
+
+    # make sure gc_finetuning_iterations is an int
+    if not isinstance(gc_finetuning_iterations, int):
+        raise ValueError("gc_finetuning_iterations must be an integer.")
+    # make sure gc_finetuning_iterations is greater than 0
+    if gc_finetuning_iterations <= 0:
+        raise ValueError("gc_finetuning_iterations must be greater than 0.")
+    
+    # make sure gc_weight is a float
+    if not isinstance(gc_weight, (int, float)):
+        raise ValueError("gc_weight must be a float.")
+    # make sure gc_weight is greater than 0
+    if gc_weight <= 0:
+        raise ValueError("gc_weight must be greater than 0.")
+    
+    # make sure codon_weight is a float
+    if not isinstance(codon_weight, (int, float)):
+        raise ValueError("codon_weight must be a float.")
+    # make sure codon_weight is greater than 0
+    if codon_weight <= 0:
+        raise ValueError("codon_weight must be greater than 0.")
+    
+    # make sure verify_coding_sequence is a bool
+    if not isinstance(verify_coding_sequence, bool):
+        raise ValueError("verify_coding_sequence must be a boolean.")
+
+    # make sure minimum_codon_probability is a float
+    if minimum_codon_probability != None:
+        if not isinstance(minimum_codon_probability, (int, float)):
+            raise ValueError("minimum_codon_probability must be a float.")
+        # make sure minimum_codon_probability is between 0 and 1
+        if minimum_codon_probability < 0 or minimum_codon_probability > 1:
+            raise ValueError("minimum_codon_probability must be between 0 and 1.")
     else:
-        final_dict = new_dict
-
-    # make sure len new_dict is same as protein_sequences
-    if len(final_dict) != len(protein_sequences):
-        raise ValueError("Number of input protein sequences does not match number of generated nucleotide sequences")
+        minimum_codon_probability = 0.0
     
-    return final_dict  # Added explicit return statement
+    # make sure show_progress is a bool
+    if not isinstance(show_progress, bool):
+        raise ValueError("show_progress must be a boolean.")
+    
+    # make sure gc_tolerance is a float
+    if not isinstance(gc_tolerance, (int, float)):
+        raise ValueError("gc_tolerance must be a float.")
+    # make sure gc_tolerance is between 0 and 1
+    if gc_tolerance < 0 or gc_tolerance > 1:
+        raise ValueError("gc_tolerance must be between 0 and 1.")
+    
+    # make sure verify_unique_protein_sequences is a bool
+    if not isinstance(verify_unique_protein_sequences, bool):
+        raise ValueError("verify_unique_protein_sequences must be a boolean.")
+    
+    # make sure verify_start_stop_codons_in_adapters is a bool
+    if not isinstance(verify_start_stop_codons_in_adapters, bool):
+        raise ValueError("verify_start_stop_codons_in_adapters must be a boolean.")
+    
+    # make sure add_protein_identifiers is a bool
+    if not isinstance(add_protein_identifiers, bool):
+        raise ValueError("add_protein_identifiers must be a boolean.")
+    
+    # make sure protein_identifier_length is an int
+    if not isinstance(protein_identifier_length, int):
+        raise ValueError("protein_identifier_length must be an integer.")
+    
+    # make sure protein_identifier_length is greater than 0
+    if protein_identifier_length <= 0:
+        raise ValueError("protein_identifier_length must be greater than 0.")
+    
+
+    # make sure codon_frequency_table is a dictionary
+    if not isinstance(codon_frequency_table, dict):
+        raise ValueError("codon_frequency_table must be a dictionary.")
+    
+    # make sure show_optimization_progress is a bool
+    if not isinstance(show_optimization_progress, bool):
+        raise ValueError("show_optimization_progress must be a boolean.")
+
+    # initialize codon table. 
+    codon_table_obj = CodonTable(codon_frequency_table,
+                                    codon_weight,
+                                    gc_weight,
+                                    target_gc_range,
+                                    minimum_codon_probability)
+    
+    # make everything a sequence object
+    sequence_objects=[]
+    for i in range(len(sequences)):
+        sequence_objects.append(Sequence(sequences[i], codon_table_obj,
+                                         names[i], adapter_3_prime,
+                                         adapter_5_prime, 
+                                         avoid_adding_start_codons,
+                                         avoid_adding_stop_codons,
+                                         total_length,
+                                         pad_location,
+                                         force_start_codon=force_start_codon,
+                                         force_stop_codon=force_stop_codon,
+                                         verify_coding_sequence=verify_coding_sequence,
+                                         return_best=return_best,
+                                         padding_attempts=padding_attempts))
+
+    # Shoutout to Alex Holehouse for the progress bar magic. 
+    if show_progress:
+        pbar=tqdm(total=len(sequence_objects), position=0, desc='Progress through sequences', leave=True)
+
+
+    # iterate over protein sequences in sequence_objects
+    for seq_obj in sequence_objects:
+        optimized_coding_seq = optimize_codon_usage(seq_obj.protein_sequence,
+                                            codon_table_obj,
+                                            n_iter=optimization_attempts,
+                                            fine_tuning_iterations=gc_finetuning_iterations,
+                                            return_best=return_best,
+                                            show_progress_bar=show_optimization_progress)
+        seq_obj.add_coding_sequence(optimized_coding_seq)
+
+        # now take care of padding.
+        if total_length != None:
+            seq_obj.generate_padding()
+        
+        # update progress bar
+        if show_progress:
+            pbar.update(1)
+    
+    # close progress bar
+    if show_progress:
+        pbar.close()
+
+    return sequence_objects
+
+
+
+
+
+
+
+
+
+def save_library(name_to_protein_and_nucleotide_dict,
+                 save_path):
+    '''
+    Function to save a library of nucleotide sequences to a file.
+    
+    Parameters
+    ----------
+    name_to_protein_and_nucleotide_dict (dict): Dictionary of protein names to nucleotide sequences.
+    save_path (str): Path to save the library.
+    
+    Returns
+    -------
+    None
+    '''
+    # make sure the path exists
+    if not os.path.exists(save_path):
+        raise ValueError(f"Path {save_path} does not exist.")
+    # make sure the path excluding the file name is a dir
+    if not os.path.isdir(os.path.dirname(save_path)):
+        raise ValueError(f"Path {os.path.dirname(save_path)} is not a directory.")
+    
+    # headers
+    headers = ['Protein Name', 'Protein Sequence', 'Nucleotide Sequence', 'Translated Sequence']
+    # open file
+    with open(save_path, 'w') as f:
+        # write headers
+        f.write(','.join(headers) + '\n')
+        # write data
+        for protein_name, protein_to_nucleotide in name_to_protein_and_nucleotide_dict.items():
+            for protein_sequence, nucleotide_sequence in protein_to_nucleotide.items():
+                translated_sequence = translate_sequence(nucleotide_sequence, return_stop_codon=True, return_nucleotide_sequence=True)
+                f.write(f"{protein_name},{protein_sequence},{nucleotide_sequence},{translated_sequence}\n")
+    f.close()
+
+
+    
+    
 
