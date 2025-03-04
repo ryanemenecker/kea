@@ -73,6 +73,60 @@ def _build_sequence(amino_acid_sequence, aa_weights):
     return ''.join(dna_codons)
 
 
+def _build_sequences_batch(amino_acid_sequence, aa_weights, num_sequences):
+    """
+    Build multiple DNA sequences in parallel for the same amino acid sequence.
+    
+    Parameters:
+    -----------
+    amino_acid_sequence : str
+        Amino acid sequence to encode
+    aa_weights : dict
+        Dictionary with amino acids as keys and (codons, weights) tuples as values
+    num_sequences : int
+        Number of sequences to generate simultaneously
+        
+    Returns:
+    --------
+    list of str
+        List of DNA sequences encoding the amino acid sequence
+    """
+    # Special case for single sequence
+    if num_sequences == 1:
+        return [_build_sequence(amino_acid_sequence, aa_weights)]
+    
+    # For each position in the sequence, we'll select num_sequences codons
+    seq_length = len(amino_acid_sequence)
+    
+    # Map of amino acid to its positions in the sequence
+    aa_positions = {}
+    for i, aa in enumerate(amino_acid_sequence):
+        if aa not in aa_positions:
+            aa_positions[aa] = []
+        aa_positions[aa].append(i)
+    
+    # Initialize array to hold all codons (num_sequences × sequence_length)
+    all_codons = np.empty((num_sequences, seq_length), dtype=object)
+    
+    # For each amino acid, generate codons for all its positions at once
+    for aa, positions in aa_positions.items():
+        codons, weights = aa_weights[aa]
+        # Generate codons for all occurrences of this amino acid across all sequences
+        selected_codons = np.random.choice(
+            codons, 
+            size=(num_sequences, len(positions)), 
+            p=weights,
+            replace=True
+        )
+        
+        # Place the selected codons in their corresponding positions
+        for idx, pos in enumerate(positions):
+            all_codons[:, pos] = selected_codons[:, idx]
+    
+    # Convert arrays of codons to DNA sequences
+    return [''.join(seq) for seq in all_codons]
+
+
 def _calculate_gc_content(sequence):
     """Calculate GC content of a DNA sequence more efficiently."""
     if not sequence:
@@ -456,6 +510,7 @@ def optimize_codon_usage(amino_acid_sequence,
     exploration_fraction = 0.3    # 30% of iterations for exploration
     refinement_fraction = 0.7     # 70% of iterations for refinement
     top_candidates = 10           # Number of candidates to refine
+
     
     # Initialize tracking variables
     best_score = float('-inf')
@@ -472,38 +527,54 @@ def optimize_codon_usage(amino_acid_sequence,
     exploration_iterations = int(n_iter * exploration_fraction)
     candidates = []
     
-    for _ in range(exploration_iterations):
-        # Generate a random sequence
-        sequence = _build_sequence(amino_acid_sequence, codon_table_obj.aa_weights)
+    # Determine batch size based on exploration iterations
+    # Smaller batches for shorter sequences, larger for longer ones
+    batch_size = min(100, exploration_iterations)
+    sequences_generated = 0
+    
+    while sequences_generated < exploration_iterations:
+        current_batch_size = min(batch_size, exploration_iterations - sequences_generated)
         
-        # Calculate metrics
-        gc_content = _calculate_gc_content(sequence)
-        score = _score_sequence(sequence, 
-                               codon_table_obj.gc_range, 
-                               codon_table_obj.codon_table, 
-                               codon_table_obj.gc_weight,
-                               gc_tolerance)
+        # Generate batch of sequences
+        sequences_batch = _build_sequences_batch(
+            amino_acid_sequence, 
+            codon_table_obj.aa_weights, 
+            current_batch_size
+        )
         
-        # Track candidates
-        candidates.append((sequence, score, gc_content))
-        
-        # Track best overall and in-range sequences
-        if score > best_score:
-            best_score = score
-            best_sequence = sequence
-        
-        if codon_table_obj.gc_range[0] <= gc_content <= codon_table_obj.gc_range[1]:
-            if score > best_in_range_score:
-                best_in_range_score = score
-                best_in_range_sequence = sequence
-                # Early stopping if we found an excellent sequence
-                if score >= early_stop_threshold:
-                    if show_progress_bar:
-                        pbar.update(exploration_iterations)
-                    break
-        
-        if show_progress_bar:
-            pbar.update(1)
+        # Process each sequence in the batch
+        for sequence in sequences_batch:
+            # Calculate metrics
+            gc_content = _calculate_gc_content(sequence)
+            score = _score_sequence(sequence, 
+                                  codon_table_obj.gc_range, 
+                                  codon_table_obj.codon_table, 
+                                  codon_table_obj.gc_weight,
+                                  gc_tolerance)
+            
+            # Track candidates
+            candidates.append((sequence, score, gc_content))
+            
+            # Update best sequences
+            if score > best_score:
+                best_score = score
+                best_sequence = sequence
+            
+            if codon_table_obj.gc_range[0] <= gc_content <= codon_table_obj.gc_range[1]:
+                if score > best_in_range_score:
+                    best_in_range_score = score
+                    best_in_range_sequence = sequence
+                    # Early stopping if we found an excellent sequence
+                    if score >= early_stop_threshold:
+                        if show_progress_bar:
+                            pbar.update(exploration_iterations - sequences_generated)
+                        sequences_generated = exploration_iterations  # Force exit the loop
+                        break
+            
+            if show_progress_bar:
+                pbar.update(1)
+                
+        sequences_generated += len(sequences_batch)
     
     # Select top candidates for refinement, ensuring diversity
     # Sort by score but also include some sequences with good GC content even if score is lower

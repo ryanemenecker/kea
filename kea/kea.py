@@ -40,7 +40,8 @@ def build_library(protein_sequences,
                   show_optimization_progress=True,
                   add_protein_identifiers=False,
                   protein_identifier_length=8,
-                  return_best=False):
+                  return_best=False,
+                  early_stop_threshold=0.95):
     '''
     Build a library of optimized DNA sequences that encode given protein sequences.
     
@@ -125,7 +126,7 @@ def build_library(protein_sequences,
         If True, check that input protein sequences are unique.
     
     verify_start_stop_codons_in_adapters : bool, default=False
-        If True, verify that 5' adapter ends with start codon and 3' adapter begins with stop codon.
+        If True, verify that 5' adapter and 3' adapters do not have start or stop codons. 
     
     show_optimization_progress : bool, default=True
         If True, display progress bars during sequence optimization.
@@ -244,10 +245,23 @@ def build_library(protein_sequences,
         
         optimizer = CodonOptimizer(codon_table_obj)
 
+        if verify_start_stop_codons_in_adapters:
+            if adapter_3_prime!=None:
+                if 'ATG' in adapter_3_prime:
+                    raise ValueError("3' adapter cannot contain start codon (ATG) when verify_start_stop_codons_in_adapters is True")
+                if 'TAA' in adapter_3_prime or 'TAG' in adapter_3_prime or 'TGA' in adapter_3_prime:
+                    raise ValueError("3' adapter cannot contain stop codon (TAA, TAG, TGA) when verify_start_stop_codons_in_adapters is True")
+            if adapter_5_prime!=None:
+                if 'ATG' in adapter_5_prime:
+                    raise ValueError("5' adapter cannot contain start codon (ATG) when verify_start_stop_codons_in_adapters is True")
+                if 'TAA' in adapter_5_prime or 'TAG' in adapter_5_prime or 'TGA' in adapter_5_prime:
+                    raise ValueError("5' adapter cannot contain stop codon (TAA, TAG, TGA) when verify_start_stop_codons_in_adapters is True")
+
         if adapter_3_prime==None:
             adapter_3_prime = ''
         if adapter_5_prime==None:
             adapter_5_prime = ''
+
 
         # Create sequence objects with proper error handling
         sequence_objects = []
@@ -277,7 +291,9 @@ def build_library(protein_sequences,
                     n_iter=optimization_attempts,
                     fine_tuning_iterations=gc_finetuning_iterations,
                     return_best=return_best,
-                    show_progress_bar=show_optimization_progress
+                    show_progress_bar=show_optimization_progress,
+                    early_stop_threshold=early_stop_threshold,
+                    gc_tolerance=gc_tolerance
                 )
                 
                 seq_obj.add_coding_sequence(optimized_coding_seq)
