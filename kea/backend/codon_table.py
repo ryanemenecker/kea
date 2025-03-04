@@ -5,17 +5,26 @@ Class that takes care of the codon table.
 import numpy as np
 
 class CodonTable:
+    """Codon table with GC content preferences."""
+    
     def __init__(self, codon_usage, 
                  usage_weight, gc_weight, gc_range,
-                 minimum_codon_probability=0.0):
-        '''
-        Initialize the CodonTable object with a codon usage dictionary.
-        '''
+                 minimum_codon_probability=0.0, gc_tolerance=0.025):
+        """
+        Initialize codon table with weights and GC preferences.
+        
+        Parameters:
+        ...existing parameters...
+        gc_tolerance : float
+            Allowable deviation from GC range (default 0.025 or 2.5%)
+        """
         self.codon_usage = codon_usage
         self.usage_weight = usage_weight
         self.gc_weight = gc_weight
         self.gc_range = gc_range
         self.minimum_codon_probability = minimum_codon_probability
+        self.gc_tolerance = gc_tolerance
+        self.target_gc = sum(gc_range) / 2
         
         # Calculate everything once during initialization
         self.codon_table = self.make_codon_table()
@@ -126,8 +135,8 @@ class CodonTable:
                 
                 gc_weights.append(max(0.01, gc_factor))
             
-            # Combine weights with stronger GC emphasis
-            combined_weights = np.array([uw**usage_weight * gw**(gc_weight*2) for uw, gw in zip(usage_weights, gc_weights)])
+            # Combine weights 
+            combined_weights = np.array([uw**usage_weight * gw**(gc_weight) for uw, gw in zip(usage_weights, gc_weights)])
             # Handle case where all weights are zero
             if combined_weights.sum() > 0:
                 aa_weights[aa] = (possible_codons, combined_weights/combined_weights.sum())
