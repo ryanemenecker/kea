@@ -12,6 +12,7 @@ from .backend.translation_utils import translate_sequence
 from .backend.kea_utils import generate_random_protein_ids
 from .backend.sequence import Sequence
 from .data.codon_tables import all_codon_tables
+from .backend.optimize_codon_usage import calculate_codon_adaptation_score
 
 
 
@@ -338,15 +339,18 @@ def save_library(list_of_sequence_objects, save_path):
         raise ValueError(f"Path {os.path.dirname(save_path)} is not a directory.")
     
     # headers
-    headers = ['Protein Name', 'Protein Sequence', 'Optimized Sequence', 'Coding Sequence', 'GC content Optimized Sequence', 'GC content Coding Sequence', 'Correct Translation Optimized Sequence?', 'Correct Translation Coding Sequence?']
+    headers = ['Protein Name', 'Protein Sequence', 'Optimized Sequence', 'Coding Sequence', 'GC content Optimized Sequence', 'GC content Coding Sequence', 'Correct Translation Optimized Sequence?', 'Correct Translation Coding Sequence?', 'Codon Usage Score']
     # open file
     with open(save_path, 'w') as f:
         # write headers
         f.write(','.join(headers) + '\n')
         # write data
         for seq_obj in list_of_sequence_objects:
+            # get codon table
+            codon_table = seq_obj.codon_table.codon_usage
+            score = calculate_codon_adaptation_score(seq_obj.coding_sequence, codon_table)
             # get data
-            data = [seq_obj.name, seq_obj.protein_sequence, seq_obj.full_dna_sequence, seq_obj.coding_sequence, seq_obj.gc_content_full_sequence, seq_obj.gc_content_coding_sequence, seq_obj.correct_full_translation, seq_obj.correct_coding_translation]
+            data = [seq_obj.name, seq_obj.protein_sequence, seq_obj.full_dna_sequence, seq_obj.coding_sequence, seq_obj.gc_content_full_sequence, seq_obj.gc_content_coding_sequence, seq_obj.correct_full_translation, seq_obj.correct_coding_translation, score]
             # write data
             f.write(','.join([str(d) for d in data]) + '\n')
         

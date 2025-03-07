@@ -5,6 +5,7 @@ addinging in additional padded sequences to get to a specific
 length, and more. 
 '''
 import random
+import numpy as np
 from kea.backend.optimize_codon_usage import _calculate_gc_content as calc_gc_content
 from kea.data.aa_codon_conversions import codons_to_aa, aa_to_codons
 
@@ -203,6 +204,75 @@ def add_padding(current_gc_content,
     )
     return padding
 
+
+
+def check_nucleotide_percent_similarity(sequences, return_max=True):
+    '''
+    A function that takes in a list of nucleotide sequences and does an all by all 
+    comparison to find the most similar sequences.
+
+    Parameters
+    ----------
+    sequences : list
+        List of nucleotide sequences to compare
+    return_max : bool
+        If True, returns a tuple containing:
+            - Array of maximum similarities for each sequence
+            - Array of indices of the most similar sequences
+        If False, returns the full similarity matrix
+
+    Returns
+    -------
+    tuple or numpy.ndarray
+        If return_max=True: (max_similarities, most_similar_indices)
+        If return_max=False: Full similarity matrix
+    '''
+    # Validate input sequences
+    if not sequences:
+        raise ValueError("Empty sequence list provided")
+    
+    # Convert sequences to uppercase
+    sequences = [seq.upper() for seq in sequences]
+    
+    # Check if all sequences have the same length
+    lengths = [len(seq) for seq in sequences]
+    if len(set(lengths)) > 1:
+        raise ValueError("All sequences must have the same length")
+    
+    # Check for valid nucleotides
+    valid_nucleotides = set('ATCG')
+    for seq in sequences:
+        if not set(seq).issubset(valid_nucleotides):
+            raise ValueError(f"Invalid nucleotides found in sequence: {seq}")
+
+    # Convert sequences to numpy arrays
+    seq_arrays = np.array([list(seq) for seq in sequences])
+    n_sequences, len_sequences = seq_arrays.shape
+    encoded_array = np.zeros((n_sequences, len_sequences), dtype=np.int8)
+    
+    # Encode nucleotides (A=0, C=1, G=2, T=3, N=4)
+    encoded_array[seq_arrays == 'C'] = 1
+    encoded_array[seq_arrays == 'G'] = 2
+    encoded_array[seq_arrays == 'T'] = 3
+    encoded_array[seq_arrays == 'N'] = 4
+
+    # Calculate similarity matrix
+    similarity_matrix = np.zeros((n_sequences, n_sequences))
+    for i in range(n_sequences):
+        # Count matching positions, treating N as a mismatch
+        matches = (encoded_array == encoded_array[i]) & (encoded_array != 4)
+        similarity_matrix[i, :] = np.sum(matches, axis=1) / len_sequences
+
+    if return_max:
+        # Create mask to ignore self-comparisons
+        mask = ~np.eye(n_sequences, dtype=bool)
+        # Get maximum similarities and corresponding indices
+        max_similarities = np.max(similarity_matrix * mask, axis=1)
+        most_similar_indices = np.argmax(similarity_matrix * mask, axis=1)
+        return max_similarities, most_similar_indices
+    else:
+        return similarity_matrix
+    
 
 def generate_barcode_sequences(num_barcodes, length, 
                                GC_content_range=(0.35, 0.45),

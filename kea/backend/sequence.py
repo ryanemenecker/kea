@@ -233,7 +233,6 @@ class Sequence:
             raise ValueError("Coding sequence length must be divisible by 3")
             
         translated = translate_sequence(coding_sequence, return_stop_codon=True)
-        #print(self.protein_sequence)
         if translated != self.protein_sequence:
             raise ValueError("Coding sequence does not translate to the target protein sequence")
             
