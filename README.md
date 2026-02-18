@@ -10,6 +10,9 @@ It helps you design DNA sequences that encode your target proteins while control
 - Proper integration of adapters
 - Avoidance of unwanted sequence features
 
+## Important Note
+KEA was originally made as an internal mini project to make going from protein sequence --> library easier. I do plan on improving KEA and adding additional functionality as time allows. However, it is currently focused on specific things that I need it for.
+
 ## Installation
 
 ```bash
