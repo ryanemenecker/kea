@@ -1,12 +1,18 @@
 Future implementations
 short term...
-1. Add in weighting for codon pairs.
-2. add more organisms
-3. implement dnahive (see https://dnahive.fda.gov/dna.cgi?cmd=codon_usage&id=537&mode=cocoputs)
-4. Add in ability to avoid restriction sites
-5. Add in ability to avoid repetetive regions. 
-6. Add in ability to add in restriction sites either in the sequence or at the ends. 
+1. Add in more complicated optimization including the following:
+    1a) mRNA splice sites for various organisms (avoiding cryptic and known splice sites)
+    1b) reducing mRNA secondary structure
+    1c) avoiding polyA regions that could result in problems of synthesizability and premature polyA signals)
+    1d) 
+2. Add in weighting for codon pairs.
+3. add more organisms
+4. implement dnahive (see https://dnahive.fda.gov/dna.cgi?cmd=codon_usage&id=537&mode=cocoputs)
+5. Add in ability to avoid restriction sites
+6. Add in ability to avoid repetetive regions. 
+7. Add in ability to add in restriction sites either in the sequence or at the ends. 
 
 Long term...
-1. ML-based functionaltiy that is trained on CDS for many different organisms
-2. Fine tune the network form 1 on individual organisms.
+1. Implement more versatile framework for optimization to make implementation of future features more streamlined
+2. ML-based functionaltiy that is trained on CDS for many different organisms
+3. Fine tune the network form 1 on individual organisms.
