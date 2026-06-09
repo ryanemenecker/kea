@@ -2,10 +2,6 @@
 various utility functions.
 '''
 from kea.data.aa_codon_conversions import codons_to_aa, aa_to_codons
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-from collections import defaultdict
 import random
 
 def read_fasta(path_to_file):

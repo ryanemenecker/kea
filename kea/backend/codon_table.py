@@ -12,11 +12,25 @@ class CodonTable:
                  minimum_codon_probability=0.0, gc_tolerance=0.025):
         """
         Initialize codon table with weights and GC preferences.
-        
-        Parameters:
-        ...existing parameters...
-        gc_tolerance : float
-            Allowable deviation from GC range (default 0.025 or 2.5%)
+
+        Parameters
+        ----------
+        codon_usage : dict
+            Nested dictionary of codon usage frequencies in the form
+            {amino_acid: {codon: frequency}}.
+        usage_weight : float
+            Weight factor for codon usage optimization. Higher values
+            prioritize matching the organism's natural codon usage.
+        gc_weight : float
+            Weight factor for GC content optimization. Higher values
+            prioritize hitting the target GC range.
+        gc_range : tuple of float
+            Target GC content range as (min, max), each between 0 and 1.
+        minimum_codon_probability : float, default=0.0
+            Minimum probability threshold for a codon to be considered.
+            Codons below this threshold are excluded.
+        gc_tolerance : float, default=0.025
+            Allowable deviation from GC range (default 0.025 or 2.5%).
         """
         self.codon_usage = codon_usage
         self.usage_weight = usage_weight
