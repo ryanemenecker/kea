@@ -141,7 +141,11 @@ def build_library(protein_sequences,
     return_best : bool, default=False
         If True, return the best optimization result based on constraints rather than
         the final result after all iterations.
-    
+
+    early_stop_threshold : float, default=0.95
+        Stop optimization early if a sequence reaching this fraction of the
+        theoretical maximum score is found. Must be between 0 and 1.
+
     Returns
     -------
     list of Sequence
@@ -334,9 +338,12 @@ def save_library(list_of_sequence_objects, save_path):
     -------
     None
     '''
-    # make sure the path excluding the file name is a dir
-    if not os.path.isdir(os.path.dirname(save_path)):
-        raise ValueError(f"Path {os.path.dirname(save_path)} is not a directory.")
+    # make sure the path excluding the file name is a dir.
+    # os.path.dirname returns '' for a bare filename, which means the
+    # current working directory, so treat that as valid.
+    save_dir = os.path.dirname(save_path)
+    if save_dir and not os.path.isdir(save_dir):
+        raise ValueError(f"Path {save_dir} is not a directory.")
     
     # headers
     headers = ['Protein Name', 'Protein Sequence', 'Optimized Sequence', 'Coding Sequence', 'GC content Optimized Sequence', 'GC content Coding Sequence', 'Correct Translation Optimized Sequence?', 'Correct Translation Coding Sequence?', 'Codon Usage Score']
@@ -353,8 +360,6 @@ def save_library(list_of_sequence_objects, save_path):
             data = [seq_obj.name, seq_obj.protein_sequence, seq_obj.full_dna_sequence, seq_obj.coding_sequence, seq_obj.gc_content_full_sequence, seq_obj.gc_content_coding_sequence, seq_obj.correct_full_translation, seq_obj.correct_coding_translation, score]
             # write data
             f.write(','.join([str(d) for d in data]) + '\n')
-        
-    f.close()
 
 
 

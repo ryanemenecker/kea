@@ -4,7 +4,8 @@ It's nice to visuzlie GC content and codon usage.
 '''
 
 import matplotlib.pyplot as plt
-from kea.backend.kea_utils import calc_gc_content, make_codon_table
+from kea.backend.kea_utils import make_codon_table
+from kea.backend.optimize_codon_usage import _calculate_gc_content as calc_gc_content
 import numpy as np
 
 
@@ -138,8 +139,9 @@ def graph_gc_content(sequences):
     '''
     if isinstance(sequences, str):
         sequences = [sequences]
-    # Calculate GC content for each sequence
-    gc_contents = [calc_gc_content(seq) for seq in sequences]
+    # Calculate GC content for each sequence as a percentage (0-100) so it
+    # matches the percentage axis used below.
+    gc_contents = [calc_gc_content(seq) * 100 for seq in sequences]
     
     # Create the plot
     fig, ax = plt.subplots(figsize=(10, 6))

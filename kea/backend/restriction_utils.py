@@ -182,28 +182,8 @@ def check_restriction_sites(sequence, enzymes=None, min_buffer=0):
     """
     if enzymes is None:
         return identify_restriction_sites(sequence, min_buffer)
-    
-    sequence = sequence.upper()
-    results = {}
-    
-    # Filter the enzymes to only those requested
-    filtered_enzymes = {name: site for name, site in restriction_enzymes.items() 
-                        if name in enzymes}
-    
-    # Use the same logic as identify_restriction_sites but with filtered enzymes
-    for enzyme, site_notation in filtered_enzymes.items():
-        site_info = parse_restriction_site(site_notation)
-        
-        # Skip if we couldn't parse the site properly
-        if 'pattern' not in site_info or not site_info['pattern']:
-            continue
-            
-        # Find all matches (same code as in identify_restriction_sites)
-        # ... (rest of the matching logic)
-        
-        # For brevity, I'll use the identify_restriction_sites function
-        enzyme_result = identify_restriction_sites(sequence, min_buffer)
-        if enzyme in enzyme_result:
-            results[enzyme] = enzyme_result[enzyme]
-    
-    return results
+
+    # Run the full identification once, then keep only the requested enzymes.
+    all_results = identify_restriction_sites(sequence, min_buffer)
+    return {enzyme: matches for enzyme, matches in all_results.items()
+            if enzyme in enzymes}
