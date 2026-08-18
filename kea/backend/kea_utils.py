@@ -2,10 +2,6 @@
 various utility functions.
 '''
 from kea.data.aa_codon_conversions import codons_to_aa, aa_to_codons
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-from collections import defaultdict
 import random
 
 def read_fasta(path_to_file):
@@ -44,6 +40,9 @@ def make_codon_table(sequences, require_start_codon=False):
         sequences = [sequences]
     # Count codons
     for sequence in sequences:
+        # Upper-case before the checks: soft-masked (lowercase) FASTA would
+        # otherwise fail the 'ACGT' test and be dropped, yielding an all-zero table.
+        sequence = sequence.upper()
         if require_start_codon and sequence[:3]!='ATG':
             continue
         if len(sequence) % 3 != 0:
@@ -90,25 +89,11 @@ def codon_from_fasta(path_to_file, require_start_codon=True):
               Format: {amino_acid: {codon: frequency}}
     '''
     try:
-        # Read sequences from FASTA file
+        # Read sequences from FASTA file. make_codon_table applies all of the
+        # filtering, including the require_start_codon rule -- doing an
+        # unconditional ATG pre-filter here made require_start_codon=False a no-op.
         sequences = read_fasta(path_to_file)
-        
-        # check sequences..
-        final_sequences=[]
-        # Count codons
-        for sequence in sequences:
-            if sequence[:3]!='ATG':
-                continue
-            if len(sequence) % 3 != 0:
-                continue
-            if not all(c in 'ACGT' for c in sequence):
-                continue
-            if len(sequence) < 3:
-                continue
-            final_sequences.append(sequence)
-        
-        codon_table = make_codon_table(final_sequences, require_start_codon=require_start_codon)
-        return codon_table
+        return make_codon_table(sequences, require_start_codon=require_start_codon)
         
     except FileNotFoundError:
         print(f"Error: File not found: {path_to_file}")
@@ -191,10 +176,16 @@ def generate_random_protein_ids(length_of_id,
         raise ValueError(f"Cannot generate {number_of_ids} unique IDs with length {length_of_id}. "
                          f"Maximum possible is {max_possible_ids}.")
     
-    unique_ids = set()
+    # Kept as an ordered list with a set alongside it for the membership test.
+    # Returning list(set(...)) made the ID -> protein assignment in build_library
+    # permute on every process, even with all RNGs seeded.
+    unique_ids = []
+    seen = set()
     while len(unique_ids) < number_of_ids:
         new_id = ''.join(random.choice(characters) for _ in range(length_of_id))
-        unique_ids.add(new_id)
-    
-    return list(unique_ids)
+        if new_id not in seen:
+            seen.add(new_id)
+            unique_ids.append(new_id)
+
+    return unique_ids
 

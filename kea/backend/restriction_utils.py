@@ -1,8 +1,18 @@
 '''
 Utilities for restriction enzyme analysis, including site identification and manipulation.
 
-NEED TO TEST THIS OUT!!
+EXPERIMENTAL. Nothing in build_library() uses this module yet. Two known limitations
+that have not been fixed, because getting them right needs NEB-derived test vectors:
 
+1. Forward strand only. 73 of the 251 enzymes have non-palindromic recognition
+   sites, so their reverse-strand occurrences are not reported.
+2. Cut positions for the offset notations, e.g. 'CTGAAG(16/14)' and 'CCGC(-3/-1)',
+   are measured from the start of the match rather than from the 3' end of the
+   recognition site, so those coordinates are wrong. Site *detection* is correct;
+   only the reported cut offsets are not.
+
+Treat the returned 'start'/'end'/'match_sequence' fields as reliable and the
+'top_cut'/'bottom_cut' fields as provisional.
 '''
 
 import re
@@ -24,9 +34,20 @@ def parse_restriction_site(site_notation):
         Dictionary containing recognition sequence, cut positions, and regex pattern
     """
     result = {'original': site_notation}
-    
+
+    # Handle complex double-cut enzymes, e.g. BaeI '(10/15)ACNNNNGTAYC(12/7)'.
+    # This has to be tested BEFORE the generic paren branch below, which would
+    # otherwise match first and produce a corrupt recognition site.
+    if site_notation.startswith('('):
+        pattern = r'\((\d+)/(\d+)\)([^(]+)\((\d+)/(\d+)\)'
+        match = re.search(pattern, site_notation)
+        if match:
+            result['recognition_site'] = match.group(3)
+            # For these complex sites, store both cut positions
+            result['first_cut'] = (int(match.group(1)), int(match.group(2)))
+            result['second_cut'] = (int(match.group(4)), int(match.group(5)))
     # Handle cut site with position numbers
-    if '(' in site_notation and ')' in site_notation:
+    elif '(' in site_notation and ')' in site_notation:
         # Extract the recognition sequence and cut positions
         pattern = r'([^(]+)\(([^/]+)/([^)]+)\)'
         match = re.search(pattern, site_notation)
@@ -46,15 +67,6 @@ def parse_restriction_site(site_notation):
             result['recognition_site'] = parts[0] + parts[1]
             result['top_cut'] = len(parts[0])
             result['bottom_cut'] = len(parts[0])
-    # Handle complex double-cut enzymes
-    elif site_notation.startswith('('):
-        pattern = r'\((\d+)/(\d+)\)([^(]+)\((\d+)/(\d+)\)'
-        match = re.search(pattern, site_notation)
-        if match:
-            result['recognition_site'] = match.group(3)
-            # For these complex sites, store both cut positions
-            result['first_cut'] = (int(match.group(1)), int(match.group(2)))
-            result['second_cut'] = (int(match.group(4)), int(match.group(5)))
     else:
         # No cut site specified, just a recognition site
         result['recognition_site'] = site_notation
@@ -79,17 +91,19 @@ def site_to_regex(site):
             continue
     return pattern
 
-def identify_restriction_sites(sequence, min_buffer=0):
+def identify_restriction_sites(sequence, min_buffer=0, enzymes=None):
     """
     Identifies restriction enzyme cut sites in a given DNA sequence.
-    
+
     Parameters
     ----------
     sequence : str
         The DNA sequence to check for restriction sites
     min_buffer : int, optional
         Minimum number of nucleotides required before/after the cut site
-        
+    enzymes : iterable of str, optional
+        Restrict the search to these enzyme names. None checks every enzyme.
+
     Returns
     -------
     dict
@@ -97,8 +111,14 @@ def identify_restriction_sites(sequence, min_buffer=0):
     """
     sequence = sequence.upper()
     results = {}
-    
-    for enzyme, site_notation in restriction_enzymes.items():
+
+    if enzymes is None:
+        selected = restriction_enzymes
+    else:
+        wanted = set(enzymes)
+        selected = {name: site for name, site in restriction_enzymes.items() if name in wanted}
+
+    for enzyme, site_notation in selected.items():
         # Parse the restriction site
         site_info = parse_restriction_site(site_notation)
         
@@ -180,30 +200,7 @@ def check_restriction_sites(sequence, enzymes=None, min_buffer=0):
     dict
         Dictionary with enzyme names as keys and match information
     """
-    if enzymes is None:
-        return identify_restriction_sites(sequence, min_buffer)
-    
-    sequence = sequence.upper()
-    results = {}
-    
-    # Filter the enzymes to only those requested
-    filtered_enzymes = {name: site for name, site in restriction_enzymes.items() 
-                        if name in enzymes}
-    
-    # Use the same logic as identify_restriction_sites but with filtered enzymes
-    for enzyme, site_notation in filtered_enzymes.items():
-        site_info = parse_restriction_site(site_notation)
-        
-        # Skip if we couldn't parse the site properly
-        if 'pattern' not in site_info or not site_info['pattern']:
-            continue
-            
-        # Find all matches (same code as in identify_restriction_sites)
-        # ... (rest of the matching logic)
-        
-        # For brevity, I'll use the identify_restriction_sites function
-        enzyme_result = identify_restriction_sites(sequence, min_buffer)
-        if enzyme in enzyme_result:
-            results[enzyme] = enzyme_result[enzyme]
-    
-    return results
+    # Delegates to identify_restriction_sites with the requested subset. The
+    # previous version re-ran the full 251-enzyme scan once per requested enzyme,
+    # which made asking for every enzyme ~53x slower than asking for none.
+    return identify_restriction_sites(sequence, min_buffer, enzymes=enzymes)

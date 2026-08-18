@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import kea; print\\(kea.__version__\\); print\\(kea.__file__\\)\")"
+    ]
+  }
+}

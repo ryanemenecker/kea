@@ -4,12 +4,58 @@ Class that takes care of the codon table.
 
 import numpy as np
 
+from kea.data.aa_codon_conversions import aa_to_codons as CANONICAL_AA_TO_CODONS
+
+
+def validate_codon_usage(codon_usage):
+    '''
+    Check a codon usage table before anything downstream indexes into it.
+
+    build_library accepts a user-supplied dict. Without this check a table that is
+    missing an amino acid, or that lists a codon under the wrong one, surfaces much
+    later as a bare KeyError from inside the optimizer.
+
+    Raises
+    ------
+    ValueError
+        With a message naming the specific problem.
+    '''
+    if not isinstance(codon_usage, dict) or not codon_usage:
+        raise ValueError("Codon frequency table must be a non-empty dictionary of "
+                         "{amino_acid: {codon: frequency}}")
+
+    missing = sorted(set(CANONICAL_AA_TO_CODONS) - set(codon_usage))
+    if missing:
+        raise ValueError(f"Codon frequency table is missing amino acid(s): {', '.join(missing)}. "
+                         "It must cover all 20 amino acids plus '*' (stop).")
+
+    for aa, codons in codon_usage.items():
+        if aa not in CANONICAL_AA_TO_CODONS:
+            raise ValueError(f"Codon frequency table has an unknown amino acid key: {aa!r}")
+        if not isinstance(codons, dict) or not codons:
+            raise ValueError(f"Codon frequency table entry for {aa!r} must be a non-empty "
+                             "dictionary of {codon: frequency}")
+        valid = set(CANONICAL_AA_TO_CODONS[aa])
+        for codon, freq in codons.items():
+            if codon not in valid:
+                raise ValueError(f"Codon {codon!r} is not a valid codon for amino acid {aa!r}. "
+                                 f"Expected one of: {', '.join(sorted(valid))}")
+            if isinstance(freq, bool) or not isinstance(freq, (int, float)):
+                raise ValueError(f"Frequency for codon {codon!r} ({aa!r}) must be a number, "
+                                 f"got {type(freq).__name__}")
+            if freq < 0:
+                raise ValueError(f"Frequency for codon {codon!r} ({aa!r}) must be non-negative")
+        if sum(codons.values()) <= 0:
+            raise ValueError(f"All codon frequencies for amino acid {aa!r} are zero")
+
+
 class CodonTable:
     """Codon table with GC content preferences."""
     
     def __init__(self, codon_usage, 
                  usage_weight, gc_weight, gc_range,
-                 minimum_codon_probability=0.0, gc_tolerance=0.025):
+                 minimum_codon_probability=0.0, gc_tolerance=0.025,
+                 gc_centering=0.0, escape_gc_boundary=True):
         """
         Initialize codon table with weights and GC preferences.
         
@@ -17,13 +63,30 @@ class CodonTable:
         ...existing parameters...
         gc_tolerance : float
             Allowable deviation from GC range (default 0.025 or 2.5%)
+        gc_centering : float
+            How strongly to prefer the middle of gc_range over its edges, 0-1.
+            0 (the default) makes the GC term flat across the whole range, which
+            lets codon usage pin GC against an edge and leaves constraint repair
+            no room to move it.
+        escape_gc_boundary : bool
+            Allow the refinement search to make paired swaps that improve codon
+            usage at one position and pay the GC back at another. Without it the
+            search stalls at the GC-range edge whenever the codon-usage optimum
+            lies outside the range.
         """
+        validate_codon_usage(codon_usage)
+        # Outside 0-1 the GC objective inverts: a negative value rewards the range
+        # edges over its centre, and above 1 makes the out-of-range branch negative.
+        if not 0.0 <= gc_centering <= 1.0:
+            raise ValueError("gc_centering must be between 0 and 1")
         self.codon_usage = codon_usage
         self.usage_weight = usage_weight
         self.gc_weight = gc_weight
         self.gc_range = gc_range
         self.minimum_codon_probability = minimum_codon_probability
         self.gc_tolerance = gc_tolerance
+        self.gc_centering = gc_centering
+        self.escape_gc_boundary = escape_gc_boundary
         self.target_gc = sum(gc_range) / 2
         
         # Calculate everything once during initialization
@@ -34,19 +97,15 @@ class CodonTable:
         self.aa_weights = self.get_aa_weights()
         self.target_gc = self.get_target_gc()
 
-    def get_aa_to_codons(self, minimum_codon_probability=None):
+    def get_aa_to_codons(self):
         '''
         Function to get the amino acid to codon mapping.
+
+        Derived from self.codon_table so that it always agrees with it. Building it
+        separately from the raw codon_usage meant the two could disagree about which
+        codons minimum_codon_probability had removed.
         '''
-        if minimum_codon_probability is None:
-            minimum_codon_probability = self.minimum_codon_probability
-        aa_to_codons = {}
-        for aa in self.codon_usage:
-            aa_to_codons[aa] = []
-            for codon in self.codon_usage[aa]:
-                if self.codon_usage[aa][codon] >= minimum_codon_probability:
-                    aa_to_codons[aa].append(codon)
-        return aa_to_codons
+        return {aa: list(codons) for aa, codons in self.codon_table.items()}
 
     def get_codons_to_aa(self):
         '''
@@ -65,28 +124,35 @@ class CodonTable:
         if minimum_codon_probability is None:
             minimum_codon_probability = self.minimum_codon_probability
         
-        # dict to hold codon table. 
+        # dict to hold codon table.
         codon_table = {}
 
         # make dictionary where the key is the amino acid and the value
         # is a dictionary holding each codon and its corresponding probabilities.
-        for aa in self.codon_usage:
-            codon_table[aa] = {}
-            for codon in self.codon_usage[aa]:
-                if self.codon_usage[aa][codon] >= minimum_codon_probability:
-                    codon_table[aa][codon] = self.codon_usage[aa][codon]  
-
-        # now make sure that the probabilities sum to 1.
-        for aa in codon_table:
-            if force_minimum_one_codon and len(codon_table[aa]) == 0:
-                raise ValueError(f"No codons found for amino acid {aa}! The minimum_codon_probability is too high.")
-            total = sum(codon_table[aa].values())
+        for aa, raw in self.codon_usage.items():
+            # Normalize BEFORE filtering. minimum_codon_probability is documented as
+            # a probability, so it has to be compared against relative frequencies.
+            # Filtering the raw values first meant a table given as counts or as
+            # per-1000 values kept everything (all values above the threshold) while
+            # a table on a small scale lost everything.
+            total = sum(raw.values())
             if total > 0:
-                for codon in codon_table[aa]:
-                    codon_table[aa][codon] /= total
+                normalized = {codon: value / total for codon, value in raw.items()}
             else:
-                for codon in codon_table[aa]:
-                    codon_table[aa][codon] = 0.0
+                normalized = {codon: 0.0 for codon in raw}
+
+            kept = {codon: freq for codon, freq in normalized.items()
+                    if freq >= minimum_codon_probability}
+
+            if force_minimum_one_codon and not kept:
+                raise ValueError(f"No codons found for amino acid {aa}! The minimum_codon_probability is too high.")
+
+            # Renormalize across the surviving codons so they still sum to 1.
+            kept_total = sum(kept.values())
+            if kept_total > 0:
+                kept = {codon: freq / kept_total for codon, freq in kept.items()}
+
+            codon_table[aa] = kept
 
         return codon_table
     
@@ -117,8 +183,11 @@ class CodonTable:
         # Pre-calculate weights for each amino acid
         aa_weights = {}
         for aa in self.aa_to_codons:  
-            possible_codons = self.aa_to_codons[aa]  
-            usage_weights = [self.codon_usage[aa].get(codon, 0.01) for codon in possible_codons]
+            possible_codons = self.aa_to_codons[aa]
+            # Read frequencies from the normalized/filtered table, not the raw one,
+            # so a table supplied as counts or per-1000 behaves the same as a
+            # normalized one.
+            usage_weights = [self.codon_table[aa].get(codon, 0.01) for codon in possible_codons]
             
             # Stronger GC weighting function
             gc_weights = []

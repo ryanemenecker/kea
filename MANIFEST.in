@@ -1,3 +1,5 @@
 include CODE_OF_CONDUCT.md
+include THIRD_PARTY_NOTICES.md
+include roadmap.md
 
 global-exclude *.py[cod] __pycache__ *.so

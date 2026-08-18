@@ -24,6 +24,36 @@ def memoize(func):
     return wrapper
 
 
+# Per-table caches of derived codon scores. Codon tables are plain dicts and so
+# unhashable, which forces keying by id() -- but id() is only unique among LIVE
+# objects. Short-lived CodonTables reuse heap addresses aggressively (measured: 60
+# successive tables occupied just 6 distinct addresses), so a bare id() key hands
+# one table's scores to another. Each entry therefore keeps a strong reference to
+# the table it was computed from, which both pins the address for the entry's
+# lifetime and lets the lookup re-verify identity.
+_MAX_FREQ_CACHE = {}
+_NORM_SCORE_CACHE = {}
+
+# Bound on cached tables, so a process building many libraries does not retain
+# every codon table it has ever seen.
+_TABLE_CACHE_LIMIT = 32
+
+
+def _cache_lookup(cache, table):
+    """Return the cached value computed from exactly this table, else None."""
+    entry = cache.get(id(table))
+    if entry is not None and entry[0] is table:
+        return entry[1]
+    return None
+
+
+def _cache_store(cache, table, value):
+    if len(cache) >= _TABLE_CACHE_LIMIT:
+        cache.clear()
+    cache[id(table)] = (table, value)
+    return value
+
+
 def _build_sequence(amino_acid_sequence, aa_weights):
     """
     Helper function to build a DNA sequence based on weighted probabilities.
@@ -131,85 +161,147 @@ def _calculate_gc_content(sequence):
     """Calculate GC content of a DNA sequence more efficiently."""
     if not sequence:
         return 0
-    # Count both G and C in a single pass
-    gc_count = sum(1 for base in sequence if base in 'GCgc')
-    return gc_count / len(sequence)
+    # str.count runs in C. The previous generator expression walked the sequence
+    # one Python-level step per base and accounted for 171 million inner
+    # iterations in a 10-sequence profile.
+    return (sequence.count('G') + sequence.count('C')
+            + sequence.count('g') + sequence.count('c')) / len(sequence)
 
 
-def _score_sequence(sequence, gc_range, codon_frequency_table, gc_priority=1.0, gc_tolerance=0.025):
-    """Score a sequence based on codon usage and GC content with balanced weighting.
-    
+# G+C base count for every codon. Integer counts let callers track GC exactly
+# while swapping codons, with no floating-point drift.
+_CODON_GC_COUNT = {codon: codon.count('G') + codon.count('C') for codon in codons_to_aa}
+
+
+def _gc_score(gc_content, gc_range, gc_tolerance, gc_centering=0.0):
+    """GC term of the objective: best inside the range, decaying outside it.
+
+    Continuous and monotonically decreasing in distance from the centre of the
+    range, so a sequence closer to the target never scores worse than one further
+    away.
+
+    With gc_centering at 0 the term is flat at 1.0 everywhere inside the range,
+    which leaves the optimizer indifferent about *where* in the range it lands --
+    codon usage then drags it hard against whichever edge is closest to its own
+    optimum (human usage plus a range of (0.30, 0.42) reliably lands on 0.419).
+    Constraint repair is left with no room to shift GC. A small positive
+    gc_centering tilts the plateau toward the middle so repair has headroom by
+    construction, without meaningfully competing with codon usage.
+    """
+    low, high = gc_range
+    half_width = (high - low) / 2.0
+    # Score at either edge of the range. For a zero-width range the centre IS the
+    # edge, so there is no tilt and the edge value stays 1.0 -- computing it here
+    # keeps the outside branch continuous with the inside one in that case too.
+    edge_value = 1.0 - gc_centering if half_width > 0.0 else 1.0
+
+    if low <= gc_content <= high:
+        if gc_centering <= 0.0 or half_width <= 0.0:
+            return 1.0
+        # 0 at the centre of the range, 1 at either edge.
+        offset = abs(gc_content - (low + high) / 2.0) / half_width
+        return 1.0 - gc_centering * offset
+
+    deviation = (low - gc_content) if gc_content < low else (gc_content - high)
+    if gc_tolerance <= 0:
+        return 0.0
+    # Scaled to meet the in-range curve exactly at the boundary, so the score stays
+    # continuous and never rewards stepping outside the range.
+    return edge_value / (1.0 + deviation / gc_tolerance)
+
+
+def _combine_scores(usage_score, gc_score_value, gc_weight, codon_weight):
+    """Weighted average of the two objective terms. Always in 0-1."""
+    total_weight = gc_weight + codon_weight
+    if total_weight <= 0:
+        return 0.0
+    return (usage_score * codon_weight + gc_score_value * gc_weight) / total_weight
+
+
+def _normalized_codon_scores(codon_frequency_table):
+    """
+    Per-codon usage score (frequency / best frequency for its amino acid), cached
+    per table.
+
+    Precomputing this collapses the inner loop of _score_sequence from two dict
+    lookups plus a division per codon down to one dict lookup, and lets
+    _improve_sequence update a running total instead of rescoring whole sequences.
+    """
+    cached = _cache_lookup(_NORM_SCORE_CACHE, codon_frequency_table)
+    if cached is None:
+        max_freqs = _max_codon_frequencies(codon_frequency_table)
+        cached = {}
+        for codon, aa in codons_to_aa.items():
+            max_freq = max_freqs.get(aa, 0.0)
+            if max_freq > 0:
+                # 0.01 matches the fallback _score_sequence used for codons the
+                # minimum_codon_probability filter removed from the table.
+                cached[codon] = codon_frequency_table.get(aa, {}).get(codon, 0.01) / max_freq
+            else:
+                cached[codon] = 0.0
+        _cache_store(_NORM_SCORE_CACHE, codon_frequency_table, cached)
+    return cached
+
+
+def _max_codon_frequencies(codon_frequency_table):
+    """
+    Best (highest) codon frequency per amino acid, cached per table.
+
+    _score_sequence used to recompute max(...values()) for every codon of every
+    candidate, which is the same handful of numbers over and over.
+    """
+    cached = _cache_lookup(_MAX_FREQ_CACHE, codon_frequency_table)
+    if cached is None:
+        cached = {aa: (max(codons.values()) if codons else 0.0)
+                  for aa, codons in codon_frequency_table.items()}
+        _cache_store(_MAX_FREQ_CACHE, codon_frequency_table, cached)
+    return cached
+
+
+def _score_sequence(sequence, gc_range, codon_frequency_table, gc_weight=1.0,
+                    gc_tolerance=0.025, codon_weight=1.0, gc_centering=0.0):
+    """Score a sequence on codon usage and GC content as a weighted average.
+
     Parameters:
     - sequence: DNA sequence to score
     - gc_range: Tuple of (min_gc, max_gc) acceptable range
     - codon_frequency_table: Dictionary of codon frequencies
-    - gc_priority: Relative weight of GC content vs codon usage (0.0-2.0, capped if outside range)
-                  1.0 = equal weight, <1 favors codon usage, >1 favors GC content
-    - gc_tolerance: Allowable deviation from GC range (default 0.025 or 2.5%)
-    
+    - gc_weight: Relative weight of the GC term (>= 0)
+    - gc_tolerance: GC deviation at which the GC term falls to half credit
+    - codon_weight: Relative weight of the codon usage term (>= 0)
+
+    The two terms are combined as a weighted average, so the result is always in
+    0-1 and both weights are honoured at any magnitude. The previous formula,
+    (usage*(2 - gc_priority) + gc*gc_priority)/2 with gc_priority capped at 2,
+    silently multiplied the usage term by zero once gc_weight reached 2.
+
     Returns:
     - Combined normalized score between 0-1
     """
     if not sequence:
         return 0
-    
-    # Cap gc_priority to valid range (0-2)
-    gc_priority = min(2.0, max(0.0, gc_priority))
 
     # Number of codons
     n_codons = len(sequence) // 3
     if n_codons == 0:
         return 0
-        
-    # Calculate GC content
-    gc_content = _calculate_gc_content(sequence)
-    
-    # Expanded GC range with tolerance
-    tolerant_min = max(0, gc_range[0] - gc_tolerance)
-    tolerant_max = min(1, gc_range[1] + gc_tolerance)
-    
-    # GC content score calculation with tolerance
-    if tolerant_min <= gc_content <= tolerant_max:
-        # If within expanded range but outside original range, apply penalty
-        if gc_content < gc_range[0]:
-            gc_score = 1.0 - ((gc_range[0] - gc_content) / gc_tolerance)
-        elif gc_content > gc_range[1]:
-            gc_score = 1.0 - ((gc_content - gc_range[1]) / gc_tolerance)
-        else:
-            gc_score = 1.0
-    else:
-        if gc_content < tolerant_min:
-            distance = (tolerant_min - gc_content) / tolerant_min
-        else:
-            distance = (gc_content - tolerant_max) / (1 - tolerant_max)
-        gc_score = max(0, 1 - min(1, distance * 2))
 
-    # Codon usage score with normalization against best possible codon
-    usage_score = 0
-    for i in range(0, len(sequence), 3):
-        if i+3 <= len(sequence):  # Ensure complete codon
-            codon = sequence[i:i+3]
-            aa = codons_to_aa[codon]
-            
-            # Get this codon's frequency
-            codon_freq = codon_frequency_table[aa].get(codon, 0.01)
-            
-            # Find max frequency for this amino acid (best possible codon)
-            max_freq = max(codon_frequency_table[aa].values())
-            
-            # Normalize against the best possible codon
-            if max_freq > 0:
-                normalized_score = codon_freq / max_freq
-            else:
-                normalized_score = 0
-                
-            usage_score += normalized_score
-    
-    # Normalize usage score to 0-1 scale
-    usage_score = usage_score / n_codons
-    
-    # Final weighted score
-    return ((usage_score * (2 - gc_priority) + gc_score * gc_priority)) / 2
+    # GC term. Continuous and monotonically decreasing in distance outside the
+    # range: full credit inside, half credit one tolerance outside, decaying from
+    # there. The old piecewise version was discontinuous at the tolerance edge and
+    # inverted the ranking -- GC 0.4233 scored 0.9922 while 0.4267, which is closer
+    # to the range, scored 0.0667.
+    gc_score = _gc_score(_calculate_gc_content(sequence), gc_range, gc_tolerance,
+                         gc_centering)
+
+    # Codon usage term, normalized against the best codon available for each
+    # amino acid. The per-codon scores are precomputed and cached per table.
+    norm = _normalized_codon_scores(codon_frequency_table)
+    usage_score = 0.0
+    for i in range(0, n_codons * 3, 3):
+        usage_score += norm[sequence[i:i + 3]]
+
+    return _combine_scores(usage_score / n_codons, gc_score, gc_weight, codon_weight)
 
 
 def _adjust_gc_content(sequence, target_gc, codon_frequency_table, iterations=100):
@@ -221,10 +313,24 @@ def _adjust_gc_content(sequence, target_gc, codon_frequency_table, iterations=10
     current_gc = _calculate_gc_content(sequence)
     best_sequence = sequence
     best_gc_diff = abs(current_gc - target_gc)
-    
+
     # Break sequence into codons (use list comprehension instead of full list creation)
     codons = [sequence[i:i+3] for i in range(0, len(sequence), 3)]
-    
+
+    # GC content is tracked as an integer count over a fixed total length, and each
+    # candidate swap is scored by an exact O(1) update. The previous version copied
+    # the codon list, re-joined it and rescanned the whole string for every
+    # candidate, which dominated runtime whenever a GC range was set. Using integer
+    # counts (rather than adding float deltas) keeps the result bit-identical.
+    total_length = len(sequence)
+    if total_length == 0:
+        return sequence
+    codon_gc_counts = {codon: codon.count('G') + codon.count('C')
+                       for aa_codons in codon_frequency_table.values()
+                       for codon in aa_codons}
+    current_gc_count = sum(codon_gc_counts.get(codon, codon.count('G') + codon.count('C'))
+                           for codon in codons)
+
     for _ in range(iterations):
         # Optimization: Instead of evaluating all positions each time, 
         # sample a subset for very long sequences
@@ -235,78 +341,108 @@ def _adjust_gc_content(sequence, target_gc, codon_frequency_table, iterations=10
         best_pos = -1
         best_replacement = None
         best_score = float('-inf')
-        
+        best_gc_count = current_gc_count
+        current_diff = abs(current_gc - target_gc)
+
         for pos in positions_to_evaluate:
             codon = codons[pos]
             aa = codons_to_aa[codon]
             current_freq = codon_frequency_table[aa].get(codon, 0.01)
-            
-            # Get alternative codons for this amino acid
-            alt_codons = [c for c in aa_to_codons[aa] if c != codon]
+            codon_gc_count = codon_gc_counts[codon]
+            codon_gc = codon_gc_count / 3
+
+            # Get alternative codons for this amino acid. These come from
+            # codon_frequency_table, which has already had minimum_codon_probability
+            # applied; the module-level aa_to_codons is unfiltered and would let GC
+            # fine-tuning reintroduce codons the caller explicitly banned.
+            alt_codons = [c for c in codon_frequency_table[aa] if c != codon]
             if not alt_codons:
                 continue
                 
             # Calculate improvement metrics for each alternative
             for alt_codon in alt_codons:
                 # Calculate GC change
-                codon_gc = (codon.count('G') + codon.count('C')) / 3
-                alt_gc = (alt_codon.count('G') + alt_codon.count('C')) / 3
-                gc_delta = alt_gc - codon_gc
-                
+                alt_gc_count = codon_gc_counts[alt_codon]
+                gc_delta = (alt_gc_count - codon_gc_count) / 3
+
                 # Will this change move us in the right direction?
                 if (current_gc < target_gc and gc_delta <= 0) or (current_gc > target_gc and gc_delta >= 0):
                     continue
-                
+
                 # Calculate frequency change (cost)
                 alt_freq = codon_frequency_table[aa].get(alt_codon, 0.01)
                 freq_cost = max(0, current_freq - alt_freq)  # Only consider frequency decreases as cost
-                
+
                 # Avoid zero division
                 if freq_cost < 0.001:  # Almost no cost
                     efficiency = abs(gc_delta) * 1000  # Very high efficiency
                 else:
                     efficiency = abs(gc_delta) / freq_cost  # GC benefit per unit of frequency cost
-                
-                # Calculate impact on overall GC
-                new_codons = codons.copy()
-                new_codons[pos] = alt_codon
-                new_sequence = ''.join(new_codons)
-                new_gc = _calculate_gc_content(new_sequence)
-                gc_improvement = abs(current_gc - target_gc) - abs(new_gc - target_gc)
-                
+
+                # Exact O(1) impact on overall GC, no sequence rebuild required.
+                new_gc_count = current_gc_count - codon_gc_count + alt_gc_count
+                new_gc = new_gc_count / total_length
+                gc_improvement = current_diff - abs(new_gc - target_gc)
+
                 # Skip if moving away from target
                 if gc_improvement <= 0:
                     continue
-                
+
                 # Score combines GC improvement and codon efficiency
                 # Higher score = better change
                 score = gc_improvement * (1 + efficiency)
-                
+
                 if score > best_score:
                     best_score = score
                     best_pos = pos
                     best_replacement = alt_codon
-        
+                    best_gc_count = new_gc_count
+
         # Apply the best change if one was found
         if best_pos >= 0:
             codons[best_pos] = best_replacement
-            new_sequence = ''.join(codons)
-            new_gc = _calculate_gc_content(new_sequence)
-            
-            # Update tracking variables
-            if abs(new_gc - target_gc) < best_gc_diff:
-                best_sequence = new_sequence
-                best_gc_diff = abs(new_gc - target_gc)
-            
-            current_gc = new_gc
+            current_gc_count = best_gc_count
+            current_gc = current_gc_count / total_length
+
+            # Update tracking variables. Only materialize the string when this is
+            # actually the best sequence seen so far.
+            if abs(current_gc - target_gc) < best_gc_diff:
+                best_sequence = ''.join(codons)
+                best_gc_diff = abs(current_gc - target_gc)
         else:
             # No beneficial changes found, break the loop
             break
-    
+
     return best_sequence
 
 
-def _improve_sequence(sequence, codon_table_obj, mutation_rate=0.3):
+def _gc_delta_index(codons, norm, table):
+    """
+    Every synonymous swap in the sequence, grouped by the GC-count change it makes.
+
+    Used to escape the GC-range boundary. Entries are ordered by usage gain, so the
+    first usable one is the cheapest way to pay back a given amount of GC.
+    """
+    index = {}
+    for position, codon in enumerate(codons):
+        amino_acid = codons_to_aa.get(codon)
+        if amino_acid is None:
+            continue
+        base_norm = norm.get(codon, 0.0)
+        base_gc = _CODON_GC_COUNT[codon]
+        for alternative in table[amino_acid]:
+            if alternative == codon:
+                continue
+            delta = _CODON_GC_COUNT[alternative] - base_gc
+            if delta:
+                index.setdefault(delta, []).append(
+                    (norm[alternative] - base_norm, position, codon, alternative))
+    for entries in index.values():
+        entries.sort(reverse=True)
+    return index
+
+
+def _improve_sequence(sequence, codon_table_obj, mutation_rate=0.3, gc_tolerance=None):
     """
     Improve an existing sequence by targeted mutations of suboptimal codons.
     Optimized version with better performance characteristics.
@@ -325,129 +461,170 @@ def _improve_sequence(sequence, codon_table_obj, mutation_rate=0.3):
     str
         Improved DNA sequence if improvements were found, otherwise original sequence
     """
-    # Break sequence into codons - use array for faster manipulation
-    codons = np.array([sequence[i:i+3] for i in range(0, len(sequence), 3)])
-    n_codons = len(codons)
-    
+    n_codons = len(sequence) // 3
     if n_codons == 0:
         return sequence
-    
-    # Track if any changes were made
+
+    codons = [sequence[i:i + 3] for i in range(0, n_codons * 3, 3)]
+
+    table = codon_table_obj.codon_table
+    norm = _normalized_codon_scores(table)
+    gc_range = codon_table_obj.gc_range
+    # Fall back to the table's value only when the caller did not supply one.
+    # Reading it independently here let the refinement loop score against a
+    # different tolerance than the loop that ranks its output, so the two were
+    # optimizing subtly different objectives.
+    if gc_tolerance is None:
+        gc_tolerance = getattr(codon_table_obj, 'gc_tolerance', 0.025)
+    gc_weight = codon_table_obj.gc_weight
+    codon_weight = codon_table_obj.usage_weight
+    gc_centering = getattr(codon_table_obj, 'gc_centering', 0.0)
+    if gc_weight + codon_weight <= 0:
+        return sequence
+
+    # The objective is a function of exactly two running totals: the integer G+C
+    # base count and the sum of per-codon usage scores. Both update in O(1) when a
+    # codon is swapped, so a candidate can be scored without rebuilding the
+    # sequence. The previous version called ''.join() and rescanned every base and
+    # every codon for each candidate, which was 78% of total runtime.
+    total_length = n_codons * 3
+    gc_count = 0
+    usage_sum = 0.0
+    for codon in codons:
+        gc_count += _CODON_GC_COUNT[codon]
+        usage_sum += norm.get(codon, 0.0)
+
+    def score_of(usage_total, gc_total):
+        return _combine_scores(usage_total / n_codons,
+                               _gc_score(gc_total / total_length, gc_range, gc_tolerance,
+                                         gc_centering),
+                               gc_weight, codon_weight)
+
+    current_score = score_of(usage_sum, gc_count)
     improved = False
-    
-    # Current sequence metrics - calculate only once
-    current_gc = _calculate_gc_content(sequence)
-    current_score = _score_sequence(sequence, codon_table_obj.gc_range, 
-                                  codon_table_obj.codon_table, codon_table_obj.gc_weight,
-                                  getattr(codon_table_obj, 'gc_tolerance', 0.025))
-    
-    # Precompute GC content of each codon position
-    codon_gc_contents = np.array([(c.count('G') + c.count('C')) / 3 for c in codons])
-    
+
+    # Escaping the GC boundary.
+    #
+    # When the codon-usage optimum lies outside gc_range (human usage is ~0.59 GC
+    # against a requested (0.30, 0.42), say) this hill-climb converges hard onto
+    # the range edge: every remaining usage-improving single-codon swap pushes GC
+    # out of range and is rejected. Measured on converged sequences, ZERO
+    # single-codon improvements remained while ~3000 GC-neutral PAIR moves per
+    # sequence were still available -- improve usage at one position, pay the GC
+    # back at another. Those are invisible to a one-codon-at-a-time search.
+    #
+    # So when a swap would leave the range, look for a partner swap that brings it
+    # back. The index is built once per call; entries carry the codon they were
+    # computed from so a stale one is skipped rather than misapplied.
+    low_gc, high_gc = gc_range
+    lowest_count = low_gc * total_length
+    highest_count = high_gc * total_length
+    boundary_escape = (getattr(codon_table_obj, 'escape_gc_boundary', True)
+                       and gc_weight > 0 and (low_gc > 0.0 or high_gc < 1.0))
+    delta_index = _gc_delta_index(codons, norm, table) if boundary_escape else None
+
+    def paired_escape(primary_position, primary_usage_sum, primary_gc_count):
+        """Best (score, usage_sum, gc_count, position, codon) partner swap, or None."""
+        best = None
+        first = int(np.ceil(lowest_count - primary_gc_count - 1e-9))
+        last = int(np.floor(highest_count - primary_gc_count + 1e-9))
+        for delta in range(first, last + 1):
+            if delta == 0:
+                continue
+            for usage_delta, position, expected, replacement in delta_index.get(delta, ()):
+                if position == primary_position or codons[position] != expected:
+                    continue
+                candidate_usage = primary_usage_sum + usage_delta
+                candidate_gc = primary_gc_count + delta
+                candidate_score = score_of(candidate_usage, candidate_gc)
+                if best is None or candidate_score > best[0]:
+                    best = (candidate_score, candidate_usage, candidate_gc,
+                            position, replacement)
+                # Entries are sorted by usage gain, so the first usable one is the
+                # best available for this delta.
+                break
+        return best
+
     # Direct sampling instead of shuffling - more efficient for large sequences
-    # Sample ~mutation_rate fraction of positions for evaluation
     positions_to_check = np.random.choice(
-        n_codons, 
-        size=max(1, int(n_codons * mutation_rate)), 
+        n_codons,
+        size=max(1, int(n_codons * mutation_rate)),
         replace=False
     )
-    
-    # Pre-compute amino acids and their alternative codons for positions we'll check
-    aa_for_positions = {}
-    alt_codons_for_aa = {}
-    
+
+    # Allowed codons are cached per amino acid, taken from codon_table_obj.codon_table
+    # which has already had minimum_codon_probability applied. The module-level
+    # aa_to_codons is unfiltered and would reintroduce banned rare codons. The cache
+    # is NOT pre-filtered against the codon at one particular position, because the
+    # same amino acid appears at positions holding different codons.
+    codons_for_aa = {}
+
     for pos in positions_to_check:
         codon = codons[pos]
-        try:
-            aa = codons_to_aa[codon]
-            aa_for_positions[pos] = aa
-            
-            # Cache alternative codons for this amino acid
-            if aa not in alt_codons_for_aa:
-                alt_codons_for_aa[aa] = [c for c in aa_to_codons[aa] if c != codon]
-        except KeyError:
+        aa = codons_to_aa.get(codon)
+        if aa is None:
             # Skip invalid codons
             continue
-    
-    # Process positions in batches to improve memory locality
-    batch_size = min(100, len(positions_to_check))
-    
-    for batch_start in range(0, len(positions_to_check), batch_size):
-        batch_end = min(batch_start + batch_size, len(positions_to_check))
-        batch_positions = positions_to_check[batch_start:batch_end]
-        
-        for pos in batch_positions:
-            if pos not in aa_for_positions:
+
+        allowed_codons = codons_for_aa.get(aa)
+        if allowed_codons is None:
+            allowed_codons = codons_for_aa[aa] = tuple(table[aa])
+
+        # Nothing to swap to if this amino acid only has one allowed codon.
+        if len(allowed_codons) < 2:
+            continue
+
+        codon_gc = _CODON_GC_COUNT[codon]
+        codon_norm = norm.get(codon, 0.0)
+
+        best_alt_codon = None
+        best_alt_score = current_score
+        best_usage_sum = usage_sum
+        best_gc_count = gc_count
+        best_partner = None
+
+        # Every alternative is now cheap enough to score exactly, so there is no
+        # longer a heuristic pre-filter deciding which ones are "promising". That
+        # filter used to skip candidates that improved the combined objective
+        # without improving either term on its own.
+        for alt_codon in allowed_codons:
+            if alt_codon == codon:
                 continue
-                
-            aa = aa_for_positions[pos]
-            codon = codons[pos]
-            alternatives = alt_codons_for_aa.get(aa, [])
-            
-            if not alternatives:
-                continue
-            
-            # Calculate the GC impact of replacing this codon without generating new sequences
-            codon_gc = codon_gc_contents[pos]
-            
-            # Score this position's alternatives more efficiently
-            best_alt_codon = None
-            best_alt_score = current_score
-            
-            for alt_codon in alternatives:
-                # Quickly calculate GC delta
-                alt_gc = (alt_codon.count('G') + alt_codon.count('C')) / 3
-                gc_delta = (alt_gc - codon_gc) / n_codons  # Impact on overall GC
-                
-                # Estimate new GC content directly
-                new_gc_content = current_gc + gc_delta
-                
-                # Get codon frequency info
-                alt_freq = codon_table_obj.codon_table[aa].get(alt_codon, 0.01)
-                current_freq = codon_table_obj.codon_table[aa].get(codon, 0.01)
-                
-                # Quick estimate of score change
-                # If it's unlikely to improve, skip detailed evaluation
-                freq_improvement = alt_freq - current_freq
-                
-                gc_range = codon_table_obj.gc_range
-                gc_tolerance = getattr(codon_table_obj, 'gc_tolerance', 0.025)
-                
-                # See if this change would improve GC content fit
-                gc_improved = False
-                if new_gc_content >= gc_range[0] - gc_tolerance and new_gc_content <= gc_range[1] + gc_tolerance:
-                    if abs(new_gc_content - codon_table_obj.target_gc) < abs(current_gc - codon_table_obj.target_gc):
-                        gc_improved = True
-                
-                # Skip detailed evaluation if neither frequency nor GC is likely to improve
-                if freq_improvement <= 0 and not gc_improved:
-                    continue
-                
-                # Generate and score the new sequence only for promising candidates
-                new_codons = codons.copy()
-                new_codons[pos] = alt_codon
-                new_sequence = ''.join(new_codons)
-                
-                new_score = _score_sequence(
-                    new_sequence, 
-                    gc_range,
-                    codon_table_obj.codon_table, 
-                    codon_table_obj.gc_weight,
-                    gc_tolerance
-                )
-                
-                if new_score > best_alt_score:
-                    best_alt_score = new_score
+
+            new_usage_sum = usage_sum - codon_norm + norm[alt_codon]
+            new_gc_count = gc_count - codon_gc + _CODON_GC_COUNT[alt_codon]
+            new_score = score_of(new_usage_sum, new_gc_count)
+
+            if new_score > best_alt_score:
+                best_alt_score = new_score
+                best_alt_codon = alt_codon
+                best_usage_sum = new_usage_sum
+                best_gc_count = new_gc_count
+                best_partner = None
+            elif (boundary_escape
+                  and norm[alt_codon] > codon_norm
+                  and not (lowest_count <= new_gc_count <= highest_count)):
+                # Rejected only because it left the GC range, and it does improve
+                # codon usage -- worth paying the GC back somewhere else.
+                partner = paired_escape(pos, new_usage_sum, new_gc_count)
+                if partner is not None and partner[0] > best_alt_score:
+                    best_alt_score = partner[0]
                     best_alt_codon = alt_codon
-            
-            # Apply change if better alternative found
-            if best_alt_codon is not None and best_alt_score > current_score:
-                codons[pos] = best_alt_codon
-                improved = True
-                # Update current score and GC content for next evaluations
-                current_score = best_alt_score
-                current_gc = _calculate_gc_content(''.join(codons))
-    
+                    best_usage_sum = partner[1]
+                    best_gc_count = partner[2]
+                    best_partner = (partner[3], partner[4])
+
+        # Apply change if better alternative found
+        if best_alt_codon is not None:
+            codons[pos] = best_alt_codon
+            if best_partner is not None:
+                partner_position, partner_codon = best_partner
+                codons[partner_position] = partner_codon
+            usage_sum = best_usage_sum
+            gc_count = best_gc_count
+            current_score = best_alt_score
+            improved = True
+
     # Return improved sequence if changes were made
     if improved:
         return ''.join(codons)
@@ -460,9 +637,10 @@ def optimize_codon_usage(amino_acid_sequence,
                          n_iter=10000,
                          fine_tuning_iterations=500,
                          return_best=True,
-                         early_stop_threshold=0.95,
+                         early_stop_threshold=None,
                          show_progress_bar=True,
-                         gc_tolerance=0.025):
+                         gc_tolerance=0.025,
+                         no_progress_patience=25):
     '''
     Optimize codon usage for a given amino acid sequence using a hybrid approach.
     
@@ -478,13 +656,20 @@ def optimize_codon_usage(amino_acid_sequence,
         Number of iterations for fine-tuning GC content after main optimization.
     return_best : bool
         If True, return the best sequence even if it's outside the GC range.
-    early_stop_threshold : float
-        Stop optimization if a sequence with this proportion of the theoretical
-        maximum score is found.
+    early_stop_threshold : float or None, default=None
+        If set, stop as soon as an in-range sequence scores at or above this value.
+        Scores are the blended codon-usage/GC score from _score_sequence, which is
+        capped at 1.0. Note that a threshold of ~0.95 is reached almost immediately
+        for most proteins, which makes n_iter meaningless -- hence the None default.
+        Convergence is handled by no_progress_patience instead.
     show_progress_bar : bool
         If True, show a progress bar for the optimization process.
     gc_tolerance : float, default=0.025
         Allowable deviation from GC range (as a fraction, e.g., 0.025 = ±2.5%)
+    no_progress_patience : int, default=25
+        Stop refining a candidate after this many consecutive iterations that
+        produce no improvement. The unused iterations are returned to the budget
+        for the remaining candidates.
     Returns
     -------
     str
@@ -497,14 +682,23 @@ def optimize_codon_usage(amino_acid_sequence,
     if not hasattr(codon_table_obj, 'codon_table') or not hasattr(codon_table_obj, 'gc_range'):
         raise ValueError("Invalid codon table object provided")
         
-    if not (0 <= early_stop_threshold <= 1):
-        raise ValueError("early_stop_threshold must be between 0 and 1")
+    if early_stop_threshold is not None and not (0 <= early_stop_threshold <= 1):
+        raise ValueError("early_stop_threshold must be between 0 and 1, or None to disable")
+
+    if n_iter < 1:
+        raise ValueError("n_iter must be at least 1")
+
+    if no_progress_patience < 1:
+        raise ValueError("no_progress_patience must be at least 1")
     
-    # Validate amino acid characters
-    valid_aas = set(aa_to_codons.keys())
-    invalid_aas = [aa for aa in amino_acid_sequence if aa not in valid_aas]
+    # Validate amino acid characters against the codon table actually in use, not
+    # the module-level default -- a custom table missing an amino acid would
+    # otherwise pass this check and then fail with a bare KeyError in _build_sequence.
+    valid_aas = set(codon_table_obj.aa_weights)
+    invalid_aas = sorted({aa for aa in amino_acid_sequence if aa not in valid_aas})
     if invalid_aas:
-        raise ValueError(f"Invalid amino acid(s) in sequence: {', '.join(invalid_aas)}")
+        raise ValueError(f"Invalid amino acid(s) in sequence: {', '.join(invalid_aas)}. "
+                         "The codon frequency table in use does not cover them.")
     
     # Phase parameters
     exploration_fraction = 0.3    # 30% of iterations for exploration
@@ -523,8 +717,10 @@ def optimize_codon_usage(amino_acid_sequence,
         from tqdm import tqdm
         pbar = tqdm(total=n_iter, desc='Codon optimization', leave=True)
     
-    # Phase 1: Generate diverse initial candidates through random sampling
-    exploration_iterations = int(n_iter * exploration_fraction)
+    # Phase 1: Generate diverse initial candidates through random sampling.
+    # Floor at 1: int(n_iter * 0.3) is 0 for n_iter <= 3, which used to leave
+    # best_sequence as None and crash later with an opaque TypeError.
+    exploration_iterations = max(1, int(n_iter * exploration_fraction))
     candidates = []
     
     # Determine batch size based on exploration iterations
@@ -546,11 +742,13 @@ def optimize_codon_usage(amino_acid_sequence,
         for sequence in sequences_batch:
             # Calculate metrics
             gc_content = _calculate_gc_content(sequence)
-            score = _score_sequence(sequence, 
-                                  codon_table_obj.gc_range, 
-                                  codon_table_obj.codon_table, 
+            score = _score_sequence(sequence,
+                                  codon_table_obj.gc_range,
+                                  codon_table_obj.codon_table,
                                   codon_table_obj.gc_weight,
-                                  gc_tolerance)
+                                  gc_tolerance,
+                                  codon_table_obj.usage_weight,
+                                  getattr(codon_table_obj, 'gc_centering', 0.0))
             
             # Track candidates
             candidates.append((sequence, score, gc_content))
@@ -565,7 +763,7 @@ def optimize_codon_usage(amino_acid_sequence,
                     best_in_range_score = score
                     best_in_range_sequence = sequence
                     # Early stopping if we found an excellent sequence
-                    if score >= early_stop_threshold:
+                    if early_stop_threshold is not None and score >= early_stop_threshold:
                         if show_progress_bar:
                             pbar.update(exploration_iterations - sequences_generated)
                         sequences_generated = exploration_iterations  # Force exit the loop
@@ -605,38 +803,58 @@ def optimize_codon_usage(amino_acid_sequence,
         
         # Starting point
         current = base_sequence
-        
+        # _improve_sequence samples a random subset of positions each call, so a
+        # single empty pass is not proof of convergence -- but a long run of them
+        # is. Without this counter the loop spins on no-ops: measured 98% of 3500
+        # calls returning the sequence unchanged.
+        stagnant = 0
+
         # Evolve this candidate through multiple iterations
-        for _ in range(candidate_iters):
+        for iteration in range(candidate_iters):
             # Try improving the sequence
-            improved = _improve_sequence(current, codon_table_obj)
-            
+            improved = _improve_sequence(current, codon_table_obj,
+                                         gc_tolerance=gc_tolerance)
+
             # Update if improved
             if improved != current:
+                stagnant = 0
                 current = improved
-                
+
                 # Recalculate metrics
                 gc_content = _calculate_gc_content(current)
-                score = _score_sequence(current, 
-                                      codon_table_obj.gc_range, 
-                                      codon_table_obj.codon_table, 
+                score = _score_sequence(current,
+                                      codon_table_obj.gc_range,
+                                      codon_table_obj.codon_table,
                                       codon_table_obj.gc_weight,
-                                      gc_tolerance)
-                
+                                      gc_tolerance,
+                                      codon_table_obj.usage_weight,
+                                  getattr(codon_table_obj, 'gc_centering', 0.0))
+
                 # Update tracking variables
                 if score > best_score:
                     best_score = score
                     best_sequence = current
-                
+
                 if codon_table_obj.gc_range[0] <= gc_content <= codon_table_obj.gc_range[1]:
                     if score > best_in_range_score:
                         best_in_range_score = score
                         best_in_range_sequence = current
                         # Early stopping if we found an excellent sequence
-                        if score >= early_stop_threshold:
+                        if early_stop_threshold is not None and score >= early_stop_threshold:
                             remaining_iters = 0
+                            if show_progress_bar:
+                                pbar.update(candidate_iters - iteration)
                             break
-            
+            else:
+                stagnant += 1
+                if stagnant >= no_progress_patience:
+                    # This candidate has converged. Give its unused budget back so
+                    # another candidate can use it instead of burning it on no-ops.
+                    remaining_iters += candidate_iters - iteration - 1
+                    if show_progress_bar:
+                        pbar.update(candidate_iters - iteration)
+                    break
+
             if show_progress_bar:
                 pbar.update(1)
                 
@@ -646,31 +864,42 @@ def optimize_codon_usage(amino_acid_sequence,
     
     # Phase 3: Fine-tune the best sequence for GC content
     final_sequence = best_sequence
-    
+
     # If we found any sequence in range, prefer that
     if best_in_range_sequence and best_in_range_score > best_score * 0.85:
         final_sequence = best_in_range_sequence
-    
-    # Apply GC fine-tuning
-    final_sequence = _adjust_gc_content(
-        final_sequence, 
-        codon_table_obj.target_gc, 
-        codon_table_obj.codon_table,
-        iterations=fine_tuning_iterations
-    )
-    
-    # Check if final GC is within range
-    final_gc = _calculate_gc_content(final_sequence)
-    
-    # If GC content not within range and return_best is False, raise error
-    if final_gc < codon_table_obj.gc_range[0] or final_gc > codon_table_obj.gc_range[1]:
-        if not return_best:
-            raise ValueError(f"No sequence found within GC range. Best achieved: {final_gc:.3f}")
-    
-    # Close progress bar
+
+    # Apply GC fine-tuning, but only when the sequence is actually outside the
+    # requested range. gc_range is a range, not a point: fine-tuning every sequence
+    # to its midpoint collapses the whole library onto one GC value and trades away
+    # codon adaptation for a change the caller never asked for.
+    gc_min, gc_max = codon_table_obj.gc_range
+    current_gc = _calculate_gc_content(final_sequence)
+    if fine_tuning_iterations > 0 and not (gc_min <= current_gc <= gc_max):
+        # Aim just inside the nearest edge, so we make the smallest change that
+        # satisfies the constraint rather than overshooting to the middle.
+        margin = min(gc_tolerance, (gc_max - gc_min) / 2)
+        gc_target = (gc_min + margin) if current_gc < gc_min else (gc_max - margin)
+        final_sequence = _adjust_gc_content(
+            final_sequence,
+            gc_target,
+            codon_table_obj.codon_table,
+            iterations=fine_tuning_iterations
+        )
+
+    # Close the progress bar before the range check below, which may raise -- a
+    # tqdm bar left open here corrupts all subsequent terminal output.
     if show_progress_bar:
         pbar.close()
-    
+
+    # Check if final GC is within range
+    final_gc = _calculate_gc_content(final_sequence)
+
+    # If GC content not within range and return_best is False, raise error
+    if final_gc < gc_min or final_gc > gc_max:
+        if not return_best:
+            raise ValueError(f"No sequence found within GC range. Best achieved: {final_gc:.3f}")
+
     # Return final sequence
     return final_sequence
 

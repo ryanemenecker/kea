@@ -19,10 +19,12 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 requires-python = ">=3.8"
-# Declare any run-time dependencies that should be installed with the package.
-#dependencies = [
-#    "importlib-resources;python_version<'3.10'",
-#]
+# Run-time dependencies. These are imported by `import kea`, so without them a
+# fresh install fails at import time.
+dependencies = [
+    "numpy",
+    "tqdm",
+]
 
 # Update the urls once the hosting is set up.
 #[project.urls]
@@ -32,6 +34,11 @@ requires-python = ">=3.8"
 [project.optional-dependencies]
 test = [
   "pytest>=6.1.2",
+]
+# Only needed for kea.backend.kea_plotting_utils, which the package does not
+# import itself.
+plotting = [
+  "matplotlib",
 ]
 
 [tool.setuptools]
@@ -62,7 +69,10 @@ where = ["."]
 # Ref https://setuptools.pypa.io/en/latest/userguide/datafiles.html#package-data
 [tool.setuptools.package-data]
 kea = [
-    "py.typed"
+    "py.typed",
+    "data/*.txt",
+    "data/*.fasta",
+    "data/*.npz",
 ]
 
 [tool.versioningit]

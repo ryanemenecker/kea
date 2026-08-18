@@ -4,8 +4,10 @@ It's nice to visuzlie GC content and codon usage.
 '''
 
 import matplotlib.pyplot as plt
-from kea.backend.kea_utils import calc_gc_content, make_codon_table
 import numpy as np
+
+from kea.backend.kea_utils import make_codon_table
+from kea.backend.optimize_codon_usage import _calculate_gc_content as calc_gc_content
 
 
 def graph_codon_usage(sequence, codon_table):
@@ -138,9 +140,14 @@ def graph_gc_content(sequences):
     '''
     if isinstance(sequences, str):
         sequences = [sequences]
-    # Calculate GC content for each sequence
-    gc_contents = [calc_gc_content(seq) for seq in sequences]
-    
+    if not sequences:
+        raise ValueError("No sequences provided")
+    # Calculate GC content for each sequence. calc_gc_content returns a fraction,
+    # so scale to percent to match the axis label, the mean annotation and the
+    # 0-100 x limits below.
+    gc_contents = [calc_gc_content(seq) * 100 for seq in sequences]
+
+
     # Create the plot
     fig, ax = plt.subplots(figsize=(10, 6))
     

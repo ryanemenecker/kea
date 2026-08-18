@@ -39,9 +39,10 @@ class CodonOptimizer:
                  n_iter: int = 10000,
                  fine_tuning_iterations: int = 500,
                  return_best: bool = True,
-                 early_stop_threshold: float = 0.95,
+                 early_stop_threshold: Optional[float] = None,
                  show_progress_bar: bool = True,
-                 gc_tolerance: float = 0.025) -> str:
+                 gc_tolerance: float = 0.025,
+                 no_progress_patience: int = 25) -> str:
         """
         Optimize codon usage for a given amino acid sequence.
         
@@ -56,7 +57,8 @@ class CodonOptimizer:
             return_best=return_best,
             early_stop_threshold=early_stop_threshold,
             show_progress_bar=show_progress_bar,
-            gc_tolerance=gc_tolerance
+            gc_tolerance=gc_tolerance,
+            no_progress_patience=no_progress_patience
         )
         
     def calculate_adaptation_score(self, sequence: str) -> float:
