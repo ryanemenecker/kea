@@ -9,6 +9,14 @@ __pycache__/
 ./CLAUDE.md
 */CLAUDE.md
 CLAUDE.md
+.claude
+./.claude
+.claude/*
+.claude/settings.local.json
+
+*/roadmap.md
+./roadmap.md
+roadmap.md
 
 # Distribution / packaging
 .Python
