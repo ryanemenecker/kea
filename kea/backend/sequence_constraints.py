@@ -182,6 +182,7 @@ class MaxEntScanScorer:
         window, but the per-window Python loop and its 1.2M-call hashing were the
         single largest cost in a constrained build.
         """
+        sequence = _normalize_dna(sequence, "MaxEntScan donor sequence")
         if len(sequence) < 9:
             return np.empty(0, dtype=np.float64)
         codes = self._encode(sequence)
@@ -199,6 +200,7 @@ class MaxEntScanScorer:
         Returns an array of length max(0, len(sequence) - 22); entry i is the score
         of sequence[i:i+23]. Identical results to score_acceptor per window.
         """
+        sequence = _normalize_dna(sequence, "MaxEntScan acceptor sequence")
         if len(sequence) < 23:
             return np.empty(0, dtype=np.float64)
         codes = self._encode(sequence)
@@ -254,12 +256,16 @@ class HumanSpliceConstraint(SequenceConstraint):
     name = "human_splice_site"
 
     def __init__(self, donor_threshold: float = 6.0, acceptor_threshold: float = 7.0):
-        if not isinstance(donor_threshold, (int, float)):
+        if isinstance(donor_threshold, bool) or not isinstance(donor_threshold, (int, float)):
             raise ValueError("donor_threshold must be numeric")
-        if not isinstance(acceptor_threshold, (int, float)):
+        if isinstance(acceptor_threshold, bool) or not isinstance(acceptor_threshold, (int, float)):
             raise ValueError("acceptor_threshold must be numeric")
         self.donor_threshold = float(donor_threshold)
         self.acceptor_threshold = float(acceptor_threshold)
+        if not math.isfinite(self.donor_threshold):
+            raise ValueError("donor_threshold must be finite")
+        if not math.isfinite(self.acceptor_threshold):
+            raise ValueError("acceptor_threshold must be finite")
         self.scorer = MaxEntScanScorer()
 
     def find_violations(self, sequence: str) -> List[ConstraintViolation]:
@@ -351,10 +357,24 @@ class PrematurePolyadenylationConstraint(SequenceConstraint):
         self.downstream_window = downstream_window
 
     @classmethod
-    def _downstream_features(cls, downstream: str) -> Tuple[bool, bool]:
-        u_rich = any(window.count("T") >= 4 for window in _windows(downstream, 5))
-        gu_rich = any(window in cls._GU_RICH_PENTAMERS for window in _windows(downstream, 5))
+    def _downstream_feature_intervals(
+        cls, downstream: str
+    ) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+        """Return relative intervals for every supported downstream element."""
+        u_rich = []
+        gu_rich = []
+        for start, window in enumerate(_windows(downstream, 5)):
+            interval = (start, start + 5)
+            if window.count("T") >= 4:
+                u_rich.append(interval)
+            if window in cls._GU_RICH_PENTAMERS:
+                gu_rich.append(interval)
         return u_rich, gu_rich
+
+    @classmethod
+    def _downstream_features(cls, downstream: str) -> Tuple[bool, bool]:
+        u_rich, gu_rich = cls._downstream_feature_intervals(downstream)
+        return bool(u_rich), bool(gu_rich)
 
     def find_violations(self, sequence: str) -> List[ConstraintViolation]:
         sequence = _normalize_dna(sequence)
@@ -367,10 +387,20 @@ class PrematurePolyadenylationConstraint(SequenceConstraint):
                     break
                 end = start + len(signal)
                 downstream = sequence[end:end + self.downstream_window]
-                u_rich, gu_rich = self._downstream_features(downstream)
+                u_rich_intervals, gu_rich_intervals = self._downstream_feature_intervals(
+                    downstream
+                )
+                u_rich = bool(u_rich_intervals)
+                gu_rich = bool(gu_rich_intervals)
                 if not self.require_downstream_element or u_rich or gu_rich:
                     score = (3.0 if signal in self._STRONG_SIGNALS else 1.0)
                     score += float(u_rich) + float(gu_rich)
+                    downstream_intervals = tuple(
+                        (end + relative_start, end + relative_end)
+                        for relative_start, relative_end in (
+                            u_rich_intervals + gu_rich_intervals
+                        )
+                    )
                     violations.append(
                         ConstraintViolation(
                             kind="premature_polyadenylation_signal",
@@ -383,6 +413,14 @@ class PrematurePolyadenylationConstraint(SequenceConstraint):
                                 "u_rich_downstream": u_rich,
                                 "gu_rich_downstream": gu_rich,
                                 "downstream_sequence": downstream,
+                                "downstream_element_intervals": downstream_intervals,
+                                # In context-required mode, clearing every downstream
+                                # element is a valid alternative to changing the PAS
+                                # itself. Expose those bases to synonymous repair.
+                                "repair_intervals": (
+                                    downstream_intervals
+                                    if self.require_downstream_element else ()
+                                ),
                             },
                         )
                     )
@@ -655,6 +693,12 @@ def _mutable_codon_positions(
         repeat_length = int(violation.details["repeat_length"])
         intervals.append((first_start, first_start + repeat_length))
 
+    # Some constraints can be cleared outside their primary reporting interval.
+    # For a context-dependent PAS, either the hexamer or all supporting downstream
+    # elements may be changed. The intervals are absolute coordinates in the same
+    # complete sequence as violation.start/end.
+    intervals.extend(violation.details.get("repair_intervals", ()))
+
     positions = set()
     for interval_start, interval_end in intervals:
         overlap_start = max(interval_start, coding_offset)
@@ -708,28 +752,18 @@ def is_violation_unsatisfiable(
         if total > max_combinations:
             return False
 
-    # Re-scan only a local slice around the affected codons. Constraint names are
-    # not violation kinds (HumanSpliceConstraint is named "human_splice_site" but
-    # emits "human_splice_donor"/"human_splice_acceptor"), so match on the kind the
-    # violation actually carries rather than on the constraint's name.
-    window = violation.end - violation.start
-    complete = constraint_set.complete_sequence(coding_sequence)
-    first_base = constraint_set.coding_offset + positions[0] * 3
-    last_base = constraint_set.coding_offset + (positions[-1] + 1) * 3
-    slice_start = max(0, min(violation.start - window, first_base))
-    slice_end = min(len(complete), max(violation.end + window, last_base))
-
-    prefix = complete[slice_start:first_base]
-    suffix = complete[last_base:slice_end]
-    # Where the offending window sits inside the reconstructed slice.
-    target_start = violation.start - slice_start
-
     for combination in itertools.product(*choices):
-        candidate = prefix + ''.join(combination) + suffix
+        candidate_codons = list(codons)
+        for index, replacement in zip(positions, combination):
+            candidate_codons[index] = replacement
+        candidate = constraint_set.complete_sequence(''.join(candidate_codons))
         # Ask only whether THIS window is still violated. Other violations in the
-        # slice belong to other codons and are not this enumeration's business.
+        # complete sequence belong to other codons and are not this enumeration's
+        # business. Reconstructing the complete CDS also keeps disjoint repair
+        # intervals (direct repeats and PAS downstream elements) at their real
+        # coordinates instead of accidentally closing the bases between them.
         still_violated = any(
-            item.kind == violation.kind and item.start == target_start
+            item.kind == violation.kind and item.start == violation.start
             for constraint in constraint_set.constraints
             for item in constraint.find_violations(candidate)
         )

@@ -83,6 +83,43 @@ Pass a `seed` to get the same library back every time:
 results = build_library(sequences, "yeast", target_gc_range=(0.45, 0.55), seed=42)
 ```
 
+### Multiple encodings of the same protein
+
+Request several synonymous coding sequences for each input protein and enforce
+an all-pairs minimum nucleotide Hamming distance:
+
+```python
+from kea import build_library, nucleotide_hamming_distance
+
+variants = build_library(
+    {"MY_PROTEIN": "MKKFLVLLFCWAVLCEHN"},
+    "human",
+    sequences_per_protein=4,
+    minimum_hamming_distance=15,
+    hamming_distance_attempts=100,
+    avoid_human_splice_sites=True,
+    avoid_premature_polyadenylation=True,
+    seed=42,
+)
+
+for i, left in enumerate(variants):
+    for right in variants[:i]:
+        assert nucleotide_hamming_distance(
+            left.coding_sequence, right.coding_sequence
+        ) >= 15
+```
+
+The distance is an absolute nucleotide count over the coding sequence, including
+forced start/stop codons but excluding adapters and padding. Outputs are named
+`MY_PROTEIN_variant_1`, `MY_PROTEIN_variant_2`, and so on. Every variant passes
+the same GC, splice, PAS, repeat, translation, and codon-adaptation checks. If
+Kea cannot fill the requested set, accepted variants are retained and unfilled
+slots are reported with stage `sequence_diversity`; use `on_error="raise"` to
+raise `SequenceDiversityError` instead. A search failure is not a mathematical
+proof that no set exists; short proteins, proteins dominated by Met/Trp, strict
+codon filtering, and competing sequence constraints can all reduce the available
+synonymous distance.
+
 ## Key Parameters
 
 - `protein_sequences`: Input protein sequences (string, list, or dict)
@@ -118,6 +155,9 @@ results = build_library(sequences, "yeast", target_gc_range=(0.45, 0.55), seed=4
 - `transcribed_5_prime_context` / `transcribed_3_prime_context`: Transcribed vector/UTR bases to include when scanning for splice sites and PAS motifs, so junction-created sites are caught (default: None)
 - `seed`: Seed for reproducible libraries (default: None). Codon sampling uses numpy's global RNG and padding uses the stdlib `random` module, so seeding just one of them yourself is not enough — pass this instead.
 - `early_stop_threshold`: Stop optimizing a sequence once an in-range candidate reaches this blended codon-usage/GC score, 0-1 (default: None, i.e. disabled). Enabling it makes `optimization_attempts` an upper bound rather than a target; a threshold near 0.95 is reached almost immediately for most proteins and will cut optimization short.
+- `sequences_per_protein`: Number of synonymous coding sequences requested for each input protein (default: 1).
+- `minimum_hamming_distance`: Required all-pairs coding-sequence distance in differing nucleotide positions (default: 0).
+- `hamming_distance_attempts`: Maximum randomized diversification attempts for each additional encoding (default: 100).
 
 ## Human transcript constraints
 

@@ -69,6 +69,21 @@ it cannot prove that a transcript will never be spliced.
   still excluded by design; pass them as transcribed context to have them
   scanned.
 
+### Synonymous variant sets
+
+- `sequences_per_protein` requests multiple coding sequences for every input
+  protein, with stable `_variant_N` names.
+- `minimum_hamming_distance` is a hard all-pairs nucleotide-distance requirement
+  over coding sequences. `hamming_distance_attempts` bounds the randomized search
+  for each additional encoding.
+- Diversification starts from the codon-optimized sequence, prioritizes the hard
+  distance target while minimizing codon-frequency cost, preserves an already
+  satisfied GC range, and then reuses the normal constraint-repair and final-QC
+  path.
+- Infeasible sets retain accepted variants and report every unfilled slot as a
+  `sequence_diversity` failure, or raise `SequenceDiversityError` under
+  `on_error="raise"`.
+
 ### Final quality check
 
 - Every sequence passes one acceptance gate before it is returned, measuring
@@ -215,6 +230,14 @@ it cannot prove that a transcript will never be spliced.
   junctions.
 - General user-supplied forbidden motifs and protected sequence intervals.
 
+
+### 6. Capacity to check extant libraries for cryptic splice sites and premature polyadenylation
+- Enables users to be able to go and check an already-made library for any problems
+- Let's us compare to other codon optimization approaches
+
+### 7. GC bias titration across sequence
+- Start sequence with lower GC content then go higher after ~10 codons. Still target average.
+
 ## Context-dependent features
 
 These should be explicit application profiles rather than universal defaults:
@@ -244,4 +267,3 @@ These should be explicit application profiles rather than universal defaults:
    satisfy it or return an informative error with remaining sites.
 5. Computational predictions require measured smoke tests before production
    library synthesis.
-

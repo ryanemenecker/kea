@@ -23,6 +23,8 @@ from kea.backend.library_generation_utils import (check_nucleotide_percent_simil
 from kea.backend.optimize_codon_usage import (_calculate_gc_content, _score_sequence,
                                               calculate_codon_adaptation_score)
 from kea.backend.sequence import Sequence
+from kea.backend.sequence_diversity import (SequenceDiversityError,
+                                           nucleotide_hamming_distance)
 from kea.backend.sequence_constraints import (
     COMMON_HUMAN_POLYADENYLATION_SIGNALS,
     ConstraintSet,
@@ -691,13 +693,127 @@ def test_summary_reports_counts_and_reasons():
 @pytest.mark.parametrize("kwargs,message", [
     ({"optimization_attempts": 0}, "optimization_attempts must be at least 1"),
     ({"gc_finetuning_iterations": -1}, "gc_finetuning_iterations must be"),
+    ({"padding_attempts": 0}, "padding_attempts must be at least 1"),
     ({"constraint_repair_attempts": 0}, "constraint_repair_attempts must be at least 1"),
+    ({"constraint_retry_attempts": -1}, "constraint_retry_attempts must be"),
+    ({"constraint_retry_attempts": 1.5}, "constraint_retry_attempts must be"),
+    ({"constraint_retry_attempts": True}, "constraint_retry_attempts must be"),
+    ({"sequences_per_protein": 0}, "sequences_per_protein must be at least 1"),
+    ({"minimum_hamming_distance": -1}, "minimum_hamming_distance must be"),
+    ({"minimum_hamming_distance": 1.5}, "minimum_hamming_distance must be"),
+    ({"hamming_distance_attempts": 0}, "hamming_distance_attempts must be at least 1"),
 ])
 def test_configuration_errors_are_never_skipped(kwargs, message):
     """Config mistakes apply to every sequence, so they escape regardless of on_error."""
     with pytest.raises(ValueError, match=message):
         build_library("MKKFLVLL", "yeast", show_progress=False,
                       show_optimization_progress=False, **kwargs)
+
+
+# --------------------------------------------------------------------------
+# Multiple synonymous encodings per protein
+# --------------------------------------------------------------------------
+
+
+def test_multiple_encodings_meet_all_pairwise_hamming_distances_and_constraints():
+    minimum_distance = 18
+    protein = "M" + "".join(random.Random(91).choices(ALL_AAS, k=79))
+    library = build_library(
+        protein,
+        "human",
+        sequences_per_protein=4,
+        minimum_hamming_distance=minimum_distance,
+        hamming_distance_attempts=30,
+        target_gc_range=(0.45, 0.60),
+        avoid_human_splice_sites=True,
+        avoid_premature_polyadenylation=True,
+        max_homopolymer_length=5,
+        max_tandem_repeat_copies=3,
+        max_direct_repeat_length=12,
+        seed=4,
+        on_error="raise",
+        **FAST,
+    )
+
+    assert len(library) == library.requested == 4
+    assert library.n_failed == 0
+    assert [sequence.name for sequence in library] == [
+        f"Protein_0_variant_{index}" for index in range(1, 5)
+    ]
+    assert [sequence.variant_index for sequence in library] == [1, 2, 3, 4]
+    assert all(sequence.source_protein_name == "Protein_0" for sequence in library)
+
+    for index, sequence in enumerate(library):
+        assert translate_sequence(sequence.coding_sequence) == sequence.protein_sequence
+        assert sequence.quality_report.passed
+        if index == 0:
+            assert sequence.minimum_sibling_hamming_distance is None
+        else:
+            distances = [
+                nucleotide_hamming_distance(
+                    sequence.coding_sequence, previous.coding_sequence)
+                for previous in library[:index]
+            ]
+            assert min(distances) >= minimum_distance
+            assert sequence.minimum_sibling_hamming_distance == min(distances)
+
+
+def test_multiple_encoding_generation_is_reproducible_with_seed():
+    kwargs = dict(
+        sequences_per_protein=3,
+        minimum_hamming_distance=12,
+        hamming_distance_attempts=20,
+        seed=17,
+        **FAST,
+    )
+    first = build_library("MKKFLVLLFCWAVLCEHN", "human", **kwargs)
+    second = build_library("MKKFLVLLFCWAVLCEHN", "human", **kwargs)
+    assert [item.coding_sequence for item in first] == [
+        item.coding_sequence for item in second
+    ]
+
+
+def test_impossible_hamming_set_is_reported_without_losing_accepted_variant():
+    library = build_library(
+        "MWMW",
+        "human",
+        force_start_codon=False,
+        force_stop_codon=False,
+        sequences_per_protein=3,
+        minimum_hamming_distance=1,
+        hamming_distance_attempts=2,
+        seed=2,
+        **FAST,
+    )
+    assert len(library) == 1
+    assert library.requested == 3
+    assert library.n_failed == 2
+    assert all(failure.stage == "sequence_diversity" for failure in library.failures)
+    assert all(isinstance(failure.error, SequenceDiversityError)
+               for failure in library.failures)
+    assert "Best minimum distance found: 0" in str(library.failures[0].error)
+
+
+def test_impossible_hamming_set_can_fail_loudly():
+    with pytest.raises(SequenceDiversityError, match="Best minimum distance found: 0"):
+        build_library(
+            "MWMW",
+            "human",
+            force_start_codon=False,
+            force_stop_codon=False,
+            sequences_per_protein=2,
+            minimum_hamming_distance=1,
+            hamming_distance_attempts=2,
+            on_error="raise",
+            seed=2,
+            **FAST,
+        )
+
+
+def test_nucleotide_hamming_distance_requires_equal_lengths():
+    assert nucleotide_hamming_distance("AACG", "AATG") == 1
+    with pytest.raises(ValueError, match="equal length"):
+        nucleotide_hamming_distance("AACG", "AAC")
 
 
 def test_padding_does_not_reintroduce_avoided_motifs():
@@ -1131,6 +1247,22 @@ def test_maxentscan_rejects_invalid_windows():
         scorer.score_acceptor("TGTCTTTTTCTGTGTGGCAGNgg")
 
 
+def test_vectorized_maxentscan_normalizes_lowercase_like_scalar_scoring():
+    scorer = MaxEntScanScorer()
+    donor = "caggtaagt"
+    acceptor = "tgtctttttctgtgtggcagtgg"
+    assert scorer.score_donors(donor)[0] == scorer.score_donor(donor)
+    assert scorer.score_acceptors(acceptor)[0] == scorer.score_acceptor(acceptor)
+
+
+@pytest.mark.parametrize("threshold", [float("nan"), float("inf"), float("-inf")])
+def test_human_splice_thresholds_must_be_finite(threshold):
+    with pytest.raises(ValueError, match="finite"):
+        HumanSpliceConstraint(donor_threshold=threshold)
+    with pytest.raises(ValueError, match="finite"):
+        HumanSpliceConstraint(acceptor_threshold=threshold)
+
+
 def test_human_splice_constraint_finds_donor_and_acceptor():
     constraint = HumanSpliceConstraint(donor_threshold=6.0, acceptor_threshold=7.0)
     sequence = "CAGGTAAGT" + "CCCC" + "TGTCTTTTTCTGTGTGGCAGTGG"
@@ -1158,6 +1290,26 @@ def test_polyadenylation_downstream_context_can_be_required():
     gu_rich = constraint.find_violations("CCCAAGAAAGTTGTCCCC")
     assert len(gu_rich) == 1
     assert gu_rich[0].details["gu_rich_downstream"] is True
+
+
+def test_context_dependent_pas_can_be_repaired_through_its_downstream_element():
+    from kea.backend.sequence_constraints import is_violation_unsatisfiable
+
+    table = CodonTable(kea.human_hegs, 1, 0, (0, 1), 0.0)
+    constraints = ConstraintSet(
+        [PrematurePolyadenylationConstraint(require_downstream_element=True)],
+        five_prime_context="AATAAA",
+    )
+    original = "TTTTGCCCC"  # FCP; TTTTG is a U-rich element after the fixed PAS.
+    violation = constraints.find_violations(original)[0]
+
+    # TTT -> TTC preserves phenylalanine and removes the downstream support, so
+    # this fixed-context PAS is not intrinsically unsatisfiable.
+    assert is_violation_unsatisfiable(original, violation, table, constraints) is False
+    repaired, remaining = repair_coding_sequence(original, table, constraints)
+    assert translate_sequence(repaired) == translate_sequence(original) == "FCP"
+    assert remaining == []
+    assert constraints.find_violations(repaired) == []
 
 
 def test_homopolymer_constraint_reports_full_run():

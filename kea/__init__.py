@@ -21,6 +21,11 @@ from .backend.sequence_constraints import (
     make_sequence_constraints,
     repair_coding_sequence,
 )
+from .backend.sequence_diversity import (
+    SequenceDiversityError,
+    minimum_hamming_distance,
+    nucleotide_hamming_distance,
+)
 
 
 from ._version import __version__

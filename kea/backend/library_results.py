@@ -92,8 +92,8 @@ class FailedSequence:
     error : Exception
         The exception that stopped this sequence.
     stage : str
-        Which step failed: 'optimization', 'constraint_repair', 'padding', or
-        'sequence_setup'.
+        Which step failed: 'sequence_setup', 'optimization',
+        'constraint_repair', 'sequence_diversity', 'padding', or 'quality_check'.
     remaining_violations : list
         Unsatisfied ConstraintViolation records, when the failure was a
         constraint repair. Empty otherwise.

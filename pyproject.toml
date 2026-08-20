@@ -63,7 +63,8 @@ zip-safe = false
 # with include-package-data = false and namespaces = false.
 include-package-data = true
 [tool.setuptools.packages.find]
-namespaces = true
+include = ["kea*"]
+namespaces = false
 where = ["."]
 
 # Ref https://setuptools.pypa.io/en/latest/userguide/datafiles.html#package-data

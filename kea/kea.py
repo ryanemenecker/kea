@@ -19,6 +19,11 @@ from .backend.sequence_constraints import (ConstraintRepairError, is_violation_u
                                           make_sequence_constraints, repair_coding_sequence)
 from .backend.library_results import (FailedSequence, LibraryResult, QualityCheckError,
                                      evaluate_sequence)
+from .backend.sequence_diversity import (
+    SequenceDiversityError,
+    diversify_coding_sequence as _diversify_coding_sequence,
+    minimum_hamming_distance as _distance_to_closest_sequence,
+)
 from .data.codon_tables import all_codon_tables
 from .backend.sequence_report import (BASIC_COLUMNS, REPORT_COLUMNS,
                                       annotate_sequence)
@@ -56,6 +61,9 @@ def build_library(protein_sequences,
                   return_best=False,
                   early_stop_threshold=None,
                   seed=None,
+                  sequences_per_protein=1,
+                  minimum_hamming_distance=0,
+                  hamming_distance_attempts=100,
                   avoid_human_splice_sites=False,
                   maxent_donor_threshold=6.0,
                   maxent_acceptor_threshold=7.0,
@@ -182,6 +190,23 @@ def build_library(protein_sequences,
         Seed for reproducible libraries. Codon sampling uses numpy's global RNG and
         padding uses the stdlib random module, so both are seeded from this value;
         seeding only one of them yourself is not enough.
+
+    sequences_per_protein : int, default=1
+        Number of independently encoded DNA sequences requested for each input
+        protein. When greater than one, outputs are named ``<name>_variant_1``,
+        ``<name>_variant_2``, and so on.
+
+    minimum_hamming_distance : int, default=0
+        Minimum absolute number of differing nucleotide positions required between
+        every pair of coding sequences generated for the same protein. Start/stop
+        codons are included when they are forced; adapters and padding are not.
+
+    hamming_distance_attempts : int, default=100
+        Maximum randomized synonymous-diversification attempts for each additional
+        encoding. Each attempt preserves allowed codons and an already satisfied GC
+        range, then reruns sequence-constraint repair. If no candidate reaches the
+        requested all-pairs distance, the variant is reported as a
+        ``sequence_diversity`` failure.
 
     early_stop_threshold : float or None, default=None
         If set, stop optimizing a sequence as soon as an in-range candidate reaches
@@ -351,12 +376,38 @@ def build_library(protein_sequences,
         # are configuration errors -- identical for every input -- so they must
         # escape regardless of on_error rather than being recorded as thousands of
         # identical per-sequence "failures".
-        if not isinstance(optimization_attempts, int) or optimization_attempts < 1:
+        if (not isinstance(optimization_attempts, int)
+                or isinstance(optimization_attempts, bool)
+                or optimization_attempts < 1):
             raise ValueError("optimization_attempts must be at least 1")
-        if not isinstance(gc_finetuning_iterations, int) or gc_finetuning_iterations < 0:
+        if (not isinstance(gc_finetuning_iterations, int)
+                or isinstance(gc_finetuning_iterations, bool)
+                or gc_finetuning_iterations < 0):
             raise ValueError("gc_finetuning_iterations must be a non-negative integer")
-        if not isinstance(constraint_repair_attempts, int) or constraint_repair_attempts < 1:
+        if (not isinstance(padding_attempts, int)
+                or isinstance(padding_attempts, bool)
+                or padding_attempts < 1):
+            raise ValueError("padding_attempts must be at least 1")
+        if (not isinstance(constraint_repair_attempts, int)
+                or isinstance(constraint_repair_attempts, bool)
+                or constraint_repair_attempts < 1):
             raise ValueError("constraint_repair_attempts must be at least 1")
+        if (not isinstance(constraint_retry_attempts, int)
+                or isinstance(constraint_retry_attempts, bool)
+                or constraint_retry_attempts < 0):
+            raise ValueError("constraint_retry_attempts must be a non-negative integer")
+        if (not isinstance(sequences_per_protein, int)
+                or isinstance(sequences_per_protein, bool)
+                or sequences_per_protein < 1):
+            raise ValueError("sequences_per_protein must be at least 1")
+        if (not isinstance(minimum_hamming_distance, int)
+                or isinstance(minimum_hamming_distance, bool)
+                or minimum_hamming_distance < 0):
+            raise ValueError("minimum_hamming_distance must be a non-negative integer")
+        if (not isinstance(hamming_distance_attempts, int)
+                or isinstance(hamming_distance_attempts, bool)
+                or hamming_distance_attempts < 1):
+            raise ValueError("hamming_distance_attempts must be at least 1")
 
         # Validate and process input sequences first
         if isinstance(protein_sequences, str):
@@ -534,140 +585,220 @@ def build_library(protein_sequences,
                     f"sequence needs at least {longest_required} nt "
                     f"(coding sequence + adapters).")
 
-        # Build each sequence independently. A sequence that cannot satisfy the
-        # requested constraints is recorded and skipped rather than aborting the
-        # whole library -- see on_error.
+        # Build each requested encoding independently. Variants of one protein share
+        # an accepted-CDS list so every new coding sequence can be checked against
+        # every sibling, not just against the first one generated.
         sequence_objects = []
+        total_requested = len(sequences) * sequences_per_protein
         pbar = None
         try:
             if show_progress:
-                pbar = tqdm(total=len(sequences), position=0, desc='Progress through sequences', leave=True)
+                pbar = tqdm(total=total_requested, position=0,
+                            desc='Progress through sequences', leave=True)
 
-            for seq, name in zip(sequences, names):
-                stage = "sequence_setup"
-                try:
-                    seq_obj = Sequence(seq, codon_table_obj,
-                                     name, adapter_3_prime,
-                                     adapter_5_prime,
-                                     avoid_adding_start_codons,
-                                     avoid_adding_stop_codons,
-                                     total_length,
-                                     pad_location,
-                                     force_start_codon=force_start_codon,
-                                     force_stop_codon=force_stop_codon,
-                                     verify_coding_sequence=verify_coding_sequence,
-                                     return_best=return_best,
-                                     padding_attempts=padding_attempts,
-                                     constraint_set=constraint_set)
+            for seq, base_name in zip(sequences, names):
+                accepted_coding_sequences = []
+                for variant_index in range(sequences_per_protein):
+                    name = (base_name if sequences_per_protein == 1
+                            else f"{base_name}_variant_{variant_index + 1}")
+                    stage = "sequence_setup"
+                    try:
+                        seq_obj = Sequence(seq, codon_table_obj,
+                                         name, adapter_3_prime,
+                                         adapter_5_prime,
+                                         avoid_adding_start_codons,
+                                         avoid_adding_stop_codons,
+                                         total_length,
+                                         pad_location,
+                                         force_start_codon=force_start_codon,
+                                         force_stop_codon=force_stop_codon,
+                                         verify_coding_sequence=verify_coding_sequence,
+                                         return_best=return_best,
+                                         padding_attempts=padding_attempts,
+                                         constraint_set=constraint_set)
 
-                    # Codon optimization is stochastic, and constraint repair is a
-                    # greedy local search from wherever it lands. A sequence that
-                    # cannot be repaired from one starting point is often fine from
-                    # another, so re-optimize and try again rather than giving up on
-                    # the first attempt. Violations that no synonymous encoding can
-                    # clear are detected and fail immediately instead of burning
-                    # every retry on something provably impossible.
-                    for attempt in range(constraint_retry_attempts + 1):
-                        stage = "optimization"
-                        optimized_coding_seq = optimizer.optimize(
-                            seq_obj.protein_sequence,
-                            n_iter=optimization_attempts,
-                            fine_tuning_iterations=gc_finetuning_iterations,
-                            return_best=return_best,
-                            show_progress_bar=show_optimization_progress,
-                            early_stop_threshold=early_stop_threshold,
-                            gc_tolerance=gc_tolerance
-                        )
-
-                        stage = "constraint_repair"
-                        try:
-                            optimized_coding_seq, constraint_violations = repair_coding_sequence(
-                                optimized_coding_seq,
-                                codon_table_obj,
-                                constraint_set,
-                                max_iterations=constraint_repair_attempts,
+                        # Codon optimization is stochastic, and constraint repair is a
+                        # greedy local search from wherever it lands. A sequence that
+                        # cannot be repaired from one starting point is often fine from
+                        # another, so re-optimize and try again rather than giving up on
+                        # the first attempt. Violations that no synonymous encoding can
+                        # clear are detected and fail immediately.
+                        for attempt in range(constraint_retry_attempts + 1):
+                            stage = "optimization"
+                            optimized_coding_seq = optimizer.optimize(
+                                seq_obj.protein_sequence,
+                                n_iter=optimization_attempts,
+                                fine_tuning_iterations=gc_finetuning_iterations,
+                                return_best=return_best,
+                                show_progress_bar=show_optimization_progress,
+                                early_stop_threshold=early_stop_threshold,
+                                gc_tolerance=gc_tolerance
                             )
-                        except ConstraintRepairError as repair_error:
-                            impossible = [
-                                violation for violation in repair_error.remaining_violations
-                                if is_violation_unsatisfiable(
-                                    repair_error.sequence, violation,
-                                    codon_table_obj, constraint_set)
-                            ]
-                            if impossible:
-                                preview = "; ".join(
-                                    f"{item.kind} at {item.start}:{item.end} ({item.sequence}) "
-                                    f"score={item.score:.2f} vs threshold {item.threshold:.2f}"
-                                    for item in impossible[:3]
+
+                            stage = "constraint_repair"
+                            try:
+                                optimized_coding_seq, constraint_violations = repair_coding_sequence(
+                                    optimized_coding_seq,
+                                    codon_table_obj,
+                                    constraint_set,
+                                    max_iterations=constraint_repair_attempts,
                                 )
-                                raise ConstraintRepairError(
-                                    f"'{name}' cannot satisfy the requested constraints under any "
-                                    f"synonymous encoding, so retrying will not help. Relax the "
-                                    f"relevant threshold or change the protein. Unsatisfiable: {preview}",
-                                    remaining_violations=repair_error.remaining_violations,
-                                    sequence=repair_error.sequence,
-                                ) from None
-                            if attempt == constraint_retry_attempts:
-                                raise
-                        else:
-                            break
+                            except ConstraintRepairError as repair_error:
+                                impossible = [
+                                    violation for violation in repair_error.remaining_violations
+                                    if is_violation_unsatisfiable(
+                                        repair_error.sequence, violation,
+                                        codon_table_obj, constraint_set)
+                                ]
+                                if impossible:
+                                    preview = "; ".join(
+                                        f"{item.kind} at {item.start}:{item.end} ({item.sequence}) "
+                                        f"score={item.score:.2f} vs threshold {item.threshold:.2f}"
+                                        for item in impossible[:3]
+                                    )
+                                    raise ConstraintRepairError(
+                                        f"'{name}' cannot satisfy the requested constraints under any "
+                                        f"synonymous encoding, so retrying will not help. Relax the "
+                                        f"relevant threshold or change the protein. "
+                                        f"Unsatisfiable: {preview}",
+                                        remaining_violations=repair_error.remaining_violations,
+                                        sequence=repair_error.sequence,
+                                    ) from None
+                                if attempt == constraint_retry_attempts:
+                                    raise
+                            else:
+                                break
 
-                    seq_obj.sequence_constraint_violations = constraint_violations
-                    seq_obj.add_coding_sequence(optimized_coding_seq)
+                        if accepted_coding_sequences and minimum_hamming_distance > 0:
+                            stage = "sequence_diversity"
+                            best_distance = _distance_to_closest_sequence(
+                                optimized_coding_seq, accepted_coding_sequences
+                            )
+                            if minimum_hamming_distance > len(optimized_coding_seq):
+                                raise SequenceDiversityError(
+                                    f"'{name}' requested minimum_hamming_distance="
+                                    f"{minimum_hamming_distance}, but its coding sequence is only "
+                                    f"{len(optimized_coding_seq)} nt long.",
+                                    minimum_hamming_distance,
+                                    hamming_distance_attempts,
+                                    best_distance,
+                                )
 
-                    if total_length is not None:
-                        stage = "padding"
-                        seq_obj.generate_padding()
+                            for _ in range(hamming_distance_attempts):
+                                candidate = _diversify_coding_sequence(
+                                    optimized_coding_seq,
+                                    codon_table_obj,
+                                    accepted_coding_sequences,
+                                    minimum_hamming_distance,
+                                )
+                                if candidate is None:
+                                    continue
+                                try:
+                                    candidate, candidate_violations = repair_coding_sequence(
+                                        candidate,
+                                        codon_table_obj,
+                                        constraint_set,
+                                        max_iterations=constraint_repair_attempts,
+                                    )
+                                except ConstraintRepairError:
+                                    # This particular diversified encoding created a
+                                    # hard motif; another randomized encoding may not.
+                                    continue
 
-                    # Single acceptance gate. Each stage enforces its own piece, so
-                    # without this a sequence can be handed back having quietly
-                    # missed a requested target -- an out-of-range GC under
-                    # return_best=True was invisible in the returned object.
-                    # Everything is re-measured here on the final construct.
-                    stage = "quality_check"
-                    report = evaluate_sequence(
-                        seq_obj,
-                        target_gc_range=requested_gc_range,
-                        total_length=total_length,
-                        constraint_set=constraint_set,
-                        codon_usage=codon_table_obj.codon_usage,
-                        minimum_codon_adaptation=minimum_codon_adaptation,
-                        # return_best=True is an explicit request for best-effort
-                        # GC, so a miss is reported rather than fatal.
-                        gc_is_required=not return_best,
-                    )
-                    seq_obj.quality_report = report
-                    if not report.passed:
-                        raise QualityCheckError(
-                            f"'{name}' failed its final quality check: "
-                            + "; ".join(f"{check.name}={check.value} "
-                                        f"(target {check.target})" for check in report.errors),
-                            report=report,
+                                candidate_distance = _distance_to_closest_sequence(
+                                    candidate, accepted_coding_sequences
+                                )
+                                best_distance = max(best_distance, candidate_distance)
+                                if candidate_distance < minimum_hamming_distance:
+                                    continue
+                                if minimum_codon_adaptation is not None:
+                                    adaptation = calculate_codon_adaptation_score(
+                                        candidate, codon_table_obj.codon_usage)
+                                    if adaptation < minimum_codon_adaptation:
+                                        continue
+                                optimized_coding_seq = candidate
+                                constraint_violations = candidate_violations
+                                break
+                            else:
+                                raise SequenceDiversityError(
+                                    f"Could not generate '{name}' at least "
+                                    f"{minimum_hamming_distance} nt from every accepted encoding "
+                                    f"after {hamming_distance_attempts} attempts. Best minimum "
+                                    f"distance found: {best_distance}.",
+                                    minimum_hamming_distance,
+                                    hamming_distance_attempts,
+                                    best_distance,
+                                )
+
+                        sibling_distance = _distance_to_closest_sequence(
+                            optimized_coding_seq, accepted_coding_sequences
                         )
+                        seq_obj.source_protein_name = base_name
+                        seq_obj.variant_index = variant_index + 1
+                        seq_obj.minimum_sibling_hamming_distance = sibling_distance
+                        seq_obj.sequence_constraint_violations = constraint_violations
+                        seq_obj.add_coding_sequence(optimized_coding_seq)
 
-                except Exception as error:
-                    # Deliberately not a bare except: KeyboardInterrupt and
-                    # SystemExit must still stop a long library build.
-                    if on_error == "raise":
-                        raise
-                    failures.append(FailedSequence(
-                        name=name,
-                        protein_sequence=seq,
-                        error=error,
-                        stage=stage,
-                        remaining_violations=getattr(error, "remaining_violations", []),
-                    ))
-                else:
-                    sequence_objects.append(seq_obj)
+                        if total_length is not None:
+                            stage = "padding"
+                            seq_obj.generate_padding()
 
-                if pbar:
-                    pbar.update(1)
+                        # Single acceptance gate. Everything is re-measured here on
+                        # the final construct before the CDS joins the sibling set.
+                        stage = "quality_check"
+                        report = evaluate_sequence(
+                            seq_obj,
+                            target_gc_range=requested_gc_range,
+                            total_length=total_length,
+                            constraint_set=constraint_set,
+                            codon_usage=codon_table_obj.codon_usage,
+                            minimum_codon_adaptation=minimum_codon_adaptation,
+                            gc_is_required=not return_best,
+                        )
+                        seq_obj.quality_report = report
+                        if not report.passed:
+                            raise QualityCheckError(
+                                f"'{name}' failed its final quality check: "
+                                + "; ".join(f"{check.name}={check.value} "
+                                            f"(target {check.target})"
+                                            for check in report.errors),
+                                report=report,
+                            )
+
+                    except Exception as error:
+                        # Deliberately not a bare except: KeyboardInterrupt and
+                        # SystemExit must still stop a long library build.
+                        if on_error == "raise":
+                            raise
+                        # Once one slot cannot be filled, later slots cannot complete
+                        # the requested all-pairs set either. Record every unfilled
+                        # slot so requested == succeeded + failed remains meaningful.
+                        unfilled = sequences_per_protein - variant_index
+                        for failed_index in range(variant_index, sequences_per_protein):
+                            failed_name = (base_name if sequences_per_protein == 1
+                                           else f"{base_name}_variant_{failed_index + 1}")
+                            failures.append(FailedSequence(
+                                name=failed_name,
+                                protein_sequence=seq,
+                                error=error,
+                                stage=stage,
+                                remaining_violations=getattr(
+                                    error, "remaining_violations", []),
+                            ))
+                        if pbar:
+                            pbar.update(unfilled)
+                        break
+                    else:
+                        accepted_coding_sequences.append(optimized_coding_seq)
+                        sequence_objects.append(seq_obj)
+                        if pbar:
+                            pbar.update(1)
 
         finally:
             if pbar:
                 pbar.close()
 
-        library = LibraryResult(sequence_objects, failures=failures, requested=len(sequences))
+        library = LibraryResult(sequence_objects, failures=failures, requested=total_requested)
 
         if failures and show_progress:
             print(f"\n{library.summary()}")
