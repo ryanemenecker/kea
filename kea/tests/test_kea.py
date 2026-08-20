@@ -1175,33 +1175,69 @@ def test_boundary_escape_raises_codon_adaptation_without_leaving_the_range():
         assert translate_sequence(sequence.coding_sequence) == sequence.protein_sequence
 
 
-def test_boundary_escape_auto_default_follows_constraints():
-    """Auto: on without constraints (pure win), off with them (costs yield)."""
-    captured = {}
+def test_boundary_escape_auto_escalates_per_sequence():
+    """Auto builds a ladder: high-adaptation search first, permissive as fallback."""
+    captured = []
     import kea.kea as kea_module
     original = kea_module.CodonTable
 
     def spy(*args, **kwargs):
         obj = original(*args, **kwargs)
-        captured["escape"] = obj.escape_gc_boundary
+        captured.append(obj.escape_gc_boundary)
         return obj
 
     kea_module.CodonTable = spy
     try:
+        captured.clear()
         build_library("MKKFLVLLFCWAVLCEHN", "human", target_gc_range=(0.30, 0.42),
                       return_best=True, **FAST)
-        assert captured["escape"] is True
+        assert captured == [True], "no constraints: single high-adaptation rung"
 
+        captured.clear()
         build_library("MKKFLVLLFCWAVLCEHN", "human", target_gc_range=(0.30, 0.42),
                       avoid_human_splice_sites=True, return_best=True, **FAST)
-        assert captured["escape"] is False
+        assert captured == [True, False], "constraints: escalate, then fall back"
 
-        build_library("MKKFLVLLFCWAVLCEHN", "human", target_gc_range=(0.30, 0.42),
-                      avoid_human_splice_sites=True, escape_gc_boundary=True,
-                      return_best=True, **FAST)
-        assert captured["escape"] is True
+        for forced, expected in ((True, [True]), (False, [False])):
+            captured.clear()
+            build_library("MKKFLVLLFCWAVLCEHN", "human", target_gc_range=(0.30, 0.42),
+                          avoid_human_splice_sites=True, escape_gc_boundary=forced,
+                          return_best=True, **FAST)
+            assert captured == expected
     finally:
         kea_module.CodonTable = original
+
+
+def test_escalation_keeps_yield_and_raises_adaptation():
+    """The point of the ladder: permissive-search yield, high-search adaptation."""
+    random.seed(910)
+    proteins = {f"p{i}": "M" + "".join(random.choice(ALL_AAS) for _ in range(120))
+                for i in range(20)}
+    shared = dict(target_gc_range=(0.30, 0.42), avoid_human_splice_sites=True,
+                  avoid_premature_polyadenylation=True, max_homopolymer_length=5,
+                  gc_finetuning_iterations=300, return_best=True,
+                  constraint_retry_attempts=3, seed=0, **FAST)
+
+    permissive = build_library(proteins, "human", escape_gc_boundary=False, **shared)
+    escalated = build_library(proteins, "human", escape_gc_boundary=None, **shared)
+
+    def adaptation(library):
+        return mean(s.quality_report.value("codon_adaptation") for s in library)
+
+    # Falling back costs no yield: nothing the permissive search can build is lost.
+    assert escalated.n_succeeded >= permissive.n_succeeded - 1
+    assert adaptation(escalated) > adaptation(permissive)
+    for sequence in escalated:
+        assert 0.30 <= sequence.gc_content_coding_sequence <= 0.42
+        assert translate_sequence(sequence.coding_sequence) == sequence.protein_sequence
+
+
+def test_escalation_still_reports_provably_impossible_sequences():
+    """The ladder must not turn a proven-impossible protein into a silent retry loop."""
+    library = build_library({"impossible": "M" + "WYV" * 6}, "human",
+                            avoid_human_splice_sites=True, **FAST)
+    assert library.n_failed == 1
+    assert "under any synonymous encoding" in str(library.failures[0].error)
 
 
 def test_repair_does_not_reject_a_clean_sequence_on_the_last_iteration():

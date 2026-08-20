@@ -144,8 +144,19 @@ it cannot prove that a transcript will never be spliced.
   (0.30, 0.42), 50/50 built, 100% in range, ~1.7x runtime.
 - With constraints it costs yield, because maximal codon optimization is more
   repetitive: raw optimizer output goes from 2.3 to 7.7 violations per sequence,
-  and (0.28, 0.36) drops from 50.7 to 19.0 built of 60. So `escape_gc_boundary`
-  defaults to on only when no constraints are requested; `True` forces it.
+  and (0.28, 0.36) drops from 50.7 to 19.0 built of 60.
+- Resolved by escalating PER SEQUENCE rather than choosing one setting for the
+  library: try the high-adaptation search, fall back to the permissive one only
+  for sequences that cannot satisfy their constraints with it. Yield matches the
+  permissive search exactly (53.2 +- 1.5 vs 53.2 +- 1.6 over 5 seeds) while codon
+  adaptation rises 0.857 -> 0.893 at (0.30, 0.42), 0.812 -> 0.830 at (0.28, 0.36).
+  Costs 1.5-4.3x runtime. Nothing is lost by trying: across 120 proteins, zero
+  built with the escape that could not also be built without it.
+- Raising `constraint_retry_attempts` is not a substitute: 3 -> 20 retries with the
+  escape forced on moved (0.28, 0.36) from 18/60 to only 28/60 for 4x the runtime.
+- Best-of-N (keeping the highest-adaptation success instead of the first) was
+  measured and NOT adopted: +0.0001 with the escape on (the search already lands
+  near-optimal) and +0.009 with it off, which does not justify the extra attempts.
 - This supersedes `gc_centering` as the answer to the boundary problem: it gains
   more codon adaptation (+0.051 vs +0.041), keeps GC where the caller asked for it
   rather than dragging it to the range centre, and has no non-monotonic hazard band.

@@ -151,6 +151,7 @@ synonymous distance.
 - `on_error`: `"skip"` (default) records a per-sequence failure and continues; `"raise"` aborts the whole build. See [Handling failures in large libraries](#handling-failures-in-large-libraries).
 - `constraint_repair_attempts`: Maximum rounds of synonymous repair per sequence (default: 100)
 - `constraint_retry_attempts`: Extra rounds of re-optimization to try when repair fails (default: 2). Set to 0 for single-shot behaviour.
+- `escape_gc_boundary`: How hard to push codon adaptation when GC is pinned against a range edge (default: None). `None` escalates per sequence — high-adaptation search first, permissive fallback only where constraints cannot be met with it. `True` forces the high-adaptation search, `False` forces the permissive one. See [Escaping the GC boundary](#escaping-the-gc-boundary).
 - `minimum_codon_adaptation`: Reject a finished sequence whose codon adaptation score falls below this, 0-1 (default: None — measured and reported on every sequence, but not enforced).
 - `transcribed_5_prime_context` / `transcribed_3_prime_context`: Transcribed vector/UTR bases to include when scanning for splice sites and PAS motifs, so junction-created sites are caught (default: None)
 - `seed`: Seed for reproducible libraries (default: None). Codon sampling uses numpy's global RNG and padding uses the stdlib `random` module, so seeding just one of them yourself is not enough — pass this instead.
@@ -223,16 +224,15 @@ and planned expression-system-specific features.
 ## Escaping the GC boundary
 
 When the codon-usage optimum lies outside `target_gc_range` — human usage sits
-around 0.59 GC, so a requested (0.30, 0.42) is well below it — the optimizer
+around 0.59 GC, so a requested (0.30, 0.42) is well below it — a naive optimizer
 converges onto the range edge and stops. Every remaining codon swap that would
 improve usage pushes GC out of range, so a one-codon-at-a-time search has nowhere
 left to go.
 
 Measured on converged sequences: **zero** single-codon improvements remained,
 while roughly **3,000 GC-neutral pair moves per sequence** were still available —
-improve usage at one position, pay the GC back at another. Those are invisible to
-a single-codon search. Kea now makes those paired moves, which drives the count of
-missed improvements to zero:
+improve usage at one position, pay the GC back at another. Kea makes those paired
+moves, which drives the count of missed improvements to zero:
 
 ```
                       single-codon moves left    pair moves left
@@ -240,17 +240,44 @@ before                          0                     19,128
 after                           0                          0
 ```
 
-With no constraints requested this is a pure win — codon adaptation rises from
-0.859 to 0.910 on (0.30, 0.42), with every sequence still inside the GC range and
-no loss of yield.
+### How this interacts with constraints
 
-It is **off by default when sequence constraints are enabled**, because maximal
-codon optimization is more repetitive and therefore harder to make
-constraint-compliant: raw optimizer output goes from 2.3 to 7.7 violations per
-sequence, and on a tight range that costs real yield (50.7 → 19.0 built of 60 on
-(0.28, 0.36)). Pass `escape_gc_boundary=True` to force it on anyway when codon
-adaptation matters more to you than yield — on (0.30, 0.42) with constraints that
-buys about +0.047 codon adaptation for about 8 fewer sequences per 50.
+Maximal codon optimization is more repetitive, which makes a sequence harder to
+make constraint-compliant — raw optimizer output goes from 2.3 to 7.7 constraint
+violations per sequence. Running the high-adaptation search for a whole library
+therefore costs yield on tight GC ranges.
+
+So Kea escalates **per sequence** instead of picking one setting for the library:
+it runs the high-adaptation search first, and drops to the more permissive one
+only for the sequences that cannot satisfy their constraints with it. Nothing is
+lost by trying — across 120 proteins, zero sequences built with the boundary
+escape that could not also be built without it.
+
+Measured on 40–60 proteins of 180–200 aa with five constraints enabled, averaged
+over independent seeds:
+
+| `target_gc_range` | sequences built | codon adaptation | time |
+|---|---|---|---|
+| (0.30, 0.42) | unchanged | 0.857 → **0.893** | 3.8× |
+| (0.28, 0.36) | unchanged | 0.812 → **0.830** | 4.2× |
+| (0.20, 0.35) | unchanged | 0.807 → **0.820** | 4.3× |
+| (0.45, 0.60) | unchanged | 0.995 → 0.997 | 1.6× |
+| (0.35, 0.65) | unchanged | 0.999 → 0.999 | 1.5× |
+
+The gain is largest exactly where it should be — ranges that sit below the
+organism's preferred GC (about 0.59 for `"human"`, 0.35 for `"yeast"`) — and
+vanishes on ranges that already contain it, where there was no boundary to escape.
+
+`escape_gc_boundary` controls this: `None` (the default) escalates as described,
+`True` forces the high-adaptation search only, `False` forces the permissive one
+only. Forcing `True` with tight constraints buys a little more adaptation but
+loses real yield (46/60 built versus 58/60 at (0.30, 0.42)), which is why it is
+not the default.
+
+Simply raising `constraint_retry_attempts` is not a substitute: at (0.28, 0.36),
+going from 3 to 20 retries with the high-adaptation search only moved yield from
+18/60 to 28/60 while runtime went from 19s to 72s. The sequences that fail are
+structurally harder, not unlucky.
 
 ## Final quality check
 

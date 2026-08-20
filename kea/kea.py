@@ -517,16 +517,26 @@ def build_library(protein_sequences,
         if requested_gc_range is None:
             gc_centering = 0.0
 
-        # The paired boundary-escape move maximizes codon adaptation, which makes
-        # the sequence more repetitive and so harder to make constraint-compliant
-        # (measured: 2.3 -> 7.7 violations per sequence). With no constraints there
-        # is nothing to lose, so enable it; with constraints, leave it to the caller.
+        # The paired boundary-escape move maximizes codon adaptation, but the
+        # resulting sequence is more repetitive and so harder to make
+        # constraint-compliant (measured: 2.3 -> 7.7 violations per sequence).
+        #
+        # Rather than picking one setting for the whole library, escalate per
+        # sequence: try the high-adaptation search first and drop to the more
+        # permissive one only for the sequences that cannot satisfy their
+        # constraints with it. Measured on 60 x 200 aa at GC (0.30, 0.42), that
+        # recovers the full yield of the permissive search (58/60, same as running
+        # it alone) while keeping most of the adaptation gain (0.8925 vs 0.8579).
+        # Nothing is lost by trying: across 120 proteins, zero built with the
+        # boundary escape that could not also be built without it.
         if escape_gc_boundary is None:
-            use_boundary_escape = not constraint_set.constraints
+            escape_ladder = [True, False] if constraint_set.constraints else [True]
         else:
-            use_boundary_escape = bool(escape_gc_boundary)
+            escape_ladder = [bool(escape_gc_boundary)]
 
-        codon_table_obj = CodonTable(codon_frequency_table,
+        optimizer_ladder = []
+        for use_boundary_escape in escape_ladder:
+            rung_table = CodonTable(codon_frequency_table,
                                     codon_weight,
                                     gc_weight,
                                     target_gc_range,
@@ -534,8 +544,11 @@ def build_library(protein_sequences,
                                     gc_tolerance,
                                     gc_centering,
                                     use_boundary_escape)
-        
-        optimizer = CodonOptimizer(codon_table_obj)
+            optimizer_ladder.append((CodonOptimizer(rung_table), rung_table))
+
+        # The rungs differ only in how the search moves, so any of them can stand
+        # in where the codon table itself is needed.
+        codon_table_obj = optimizer_ladder[0][1]
 
         # Normalize the adapters BEFORE validating them. Sequence() upper-cases
         # adapters on the way into the construct, so a case-sensitive check here
@@ -623,9 +636,12 @@ def build_library(protein_sequences,
                         # another, so re-optimize and try again rather than giving up on
                         # the first attempt. Violations that no synonymous encoding can
                         # clear are detected and fail immediately.
-                        for attempt in range(constraint_retry_attempts + 1):
+                        succeeded = False
+                        last_repair_error = None
+                        for rung_optimizer, rung_table in optimizer_ladder:
+                          for attempt in range(constraint_retry_attempts + 1):
                             stage = "optimization"
-                            optimized_coding_seq = optimizer.optimize(
+                            optimized_coding_seq = rung_optimizer.optimize(
                                 seq_obj.protein_sequence,
                                 n_iter=optimization_attempts,
                                 fine_tuning_iterations=gc_finetuning_iterations,
@@ -639,7 +655,7 @@ def build_library(protein_sequences,
                             try:
                                 optimized_coding_seq, constraint_violations = repair_coding_sequence(
                                     optimized_coding_seq,
-                                    codon_table_obj,
+                                    rung_table,
                                     constraint_set,
                                     max_iterations=constraint_repair_attempts,
                                 )
@@ -648,7 +664,7 @@ def build_library(protein_sequences,
                                     violation for violation in repair_error.remaining_violations
                                     if is_violation_unsatisfiable(
                                         repair_error.sequence, violation,
-                                        codon_table_obj, constraint_set)
+                                        rung_table, constraint_set)
                                 ]
                                 if impossible:
                                     preview = "; ".join(
@@ -664,10 +680,20 @@ def build_library(protein_sequences,
                                         remaining_violations=repair_error.remaining_violations,
                                         sequence=repair_error.sequence,
                                     ) from None
+                                last_repair_error = repair_error
                                 if attempt == constraint_retry_attempts:
-                                    raise
+                                    # This rung is exhausted. Fall through to the
+                                    # next, more permissive one if there is one.
+                                    break
                             else:
+                                succeeded = True
                                 break
+                          if succeeded:
+                            break
+
+                        if not succeeded:
+                            stage = "constraint_repair"
+                            raise last_repair_error
 
                         if accepted_coding_sequences and minimum_hamming_distance > 0:
                             stage = "sequence_diversity"
